@@ -1,0 +1,39 @@
+[Unit]
+Description=PA Agent headless trading daemon
+Documentation=file:///opt/pa-agent/docs/服务器部署指南.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=paagent
+Group=paagent
+WorkingDirectory=/opt/pa-agent
+
+# 密钥从环境文件读，不写进 unit（unit 文件所有用户可读）
+EnvironmentFile=-/opt/pa-agent/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=TZ=Asia/Shanghai
+
+ExecStart=/opt/pa-agent/.venv/bin/python -m pa_agent.daemon
+# SIGTERM 后给 60 秒收尾（当前这一轮分析可能正在跑）
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+Restart=always
+RestartSec=10
+
+# 日志走 journald，同时也写 logs/pa_agent.log
+StandardOutput=journal
+StandardError=journal
+
+# ── 最小权限 ────────────────────────────────────────────────────────────────
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# 只有这几个目录可写
+ReadWritePaths=/opt/pa-agent/config /opt/pa-agent/logs /opt/pa-agent/trade_records /opt/pa-agent/records
+
+[Install]
+WantedBy=multi-user.target

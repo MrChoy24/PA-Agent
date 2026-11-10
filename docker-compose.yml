@@ -1,0 +1,60 @@
+# PA Agent 无头守护进程 —— 挂载与运行编排
+#
+# 用法：
+#   cp .env.example .env          # 填 AI Key、钉钉 Webhook、交易所 Key
+#   docker compose up -d
+#   docker compose logs -f
+#
+# 数据都在宿主机目录里（config/ logs/ trade_records/ records/），
+# 容器重建不丢；`docker compose down` 不会删这些目录。
+#
+# 1Panel「容器 → 编排」用法完全一致：把本文件粘进去即可（或让 1Panel
+# 读取这个目录下的 compose 文件）。首次启动时入口脚本会把挂载目录的属主
+# 修正为 10001，因此宿主机上由 root 创建的目录也不会报权限错误。
+
+services:
+  pa-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # 拉不动 Docker Hub 时改这里（构建期生效，与运行时镜像加速器无关）。
+      # 常用镜像站（选一个能通的）：
+      #   docker.m.daocloud.io/library/python:3.12-slim
+      #   dockerproxy.net/library/python:3.12-slim
+      #   hub-mirror.c.163.com/library/python:3.12-slim
+      args:
+        PYTHON_IMAGE: python:3.12-slim
+        # Debian apt 卡住时改成：https://mirrors.tuna.tsinghua.edu.cn
+        APT_MIRROR: ""
+    image: pa-agent:latest
+    # 关键：只构建、绝不拉取（否则 compose 会去 Docker Hub 找
+    # "library/pa-agent:latest"，必然 i/o timeout）
+    pull_policy: build
+    container_name: pa-agent
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # 容器内时区：K线时间戳按 UTC 对齐，但日志与记录文件名用本地时间
+      TZ: Asia/Shanghai
+      # 轮询间隔（秒）。交易所限频：Binance 现货 1200 权重/分钟，
+      # 20 秒一次 klines(权重 2) 完全安全。
+      PA_DAEMON_POLL_INTERVAL: "20"
+      # 两次分析之间的最小间隔（秒），防止 K 线抖动导致连续烧 token
+      PA_DAEMON_ANALYSIS_COOLDOWN: "120"
+      # 只在 K 线收盘后才分析（推荐 true）
+      PA_DAEMON_WAIT_BAR_CLOSE: "true"
+    volumes:
+      - ./config:/app/config            # settings.json（含 Key，注意权限）
+      - ./logs:/app/logs                # pa_agent.log
+      - ./trade_records:/app/trade_records   # 交易记录 CSV + 自动下单流水
+      - ./records:/app/records          # 每次分析的完整记录
+    # 收到 SIGTERM 后给守护进程 30 秒收尾（把统计写完再退）
+    stop_grace_period: 30s
+    # 只想跑一轮就退出（调试用）：覆盖 command
+    # command: ["--once"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

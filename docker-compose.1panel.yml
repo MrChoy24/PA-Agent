@@ -1,0 +1,73 @@
+# PA Agent 无头守护进程 —— 1Panel「编排」专用
+#
+# ⚠️ 这个文件与同目录的 docker-compose.yml 内容等价，区别只是所有路径都写成
+#    绝对路径。原因：1Panel 会把编排文件存到它自己的目录
+#    （/opt/1panel/docker/compose/<栈名>/），并在那里执行 docker compose，
+#    所以 `env_file: .env` / `context: .` / `volumes: ./config` 都会被解析到
+#    那个目录，而不是你解压的 /opt/pa-agent —— 直接报
+#    "env file .../pa-agent/.env not found"。
+#
+# 用法：
+#   1. 把本包解压到 /opt/pa-agent（路径不同的话，把下面所有 /opt/pa-agent 改掉）
+#   2. 在 /opt/pa-agent 下放好 .env
+#   3. 先在终端建好镜像（推荐，见下），再让 1Panel 启动
+#
+# ⚠️ 关于 `image: pa-agent:latest`：
+#    这个镜像**不存在于 Docker Hub**，是本地 build 出来的。1Panel 的「创建编排」
+#    会先去 registry-1.docker.io 拉这个镜像名，于是报
+#      failed to resolve reference "docker.io/library/pa-agent:latest" ... i/o timeout
+#    这不是网络/加速器问题（Docker Hub 上根本没有这个镜像，配加速也没用）。
+#    解决办法：先在终端把镜像建出来，再启动。
+#
+#    推荐用命令行一次做完（在 /opt/pa-agent 下）：
+#      docker compose -f docker-compose.1panel.yml up -d --build
+#    这个命令会先 build 再起容器，完全不会去 registry 拉取。
+#
+#    起好之后容器会自动出现在 1Panel「容器」列表里，日志/重启/终端都能在里面管。
+
+services:
+  pa-agent:
+    build:
+      context: /opt/pa-agent
+      dockerfile: Dockerfile
+      # 拉不动 Docker Hub 时改这里（构建期生效，与运行时镜像加速器无关）。
+      # 常用镜像站（选一个能通的）：
+      #   docker.m.daocloud.io/library/python:3.12-slim
+      #   dockerproxy.net/library/python:3.12-slim
+      #   hub-mirror.c.163.com/library/python:3.12-slim
+      args:
+        PYTHON_IMAGE: python:3.12-slim
+        # Debian apt 卡住时改成：https://mirrors.tuna.tsinghua.edu.cn
+        APT_MIRROR: ""
+    image: pa-agent:latest
+    # 关键：只构建、绝不拉取。缺少这行时 compose 会先去 Docker Hub 找
+    # "library/pa-agent:latest"（当然找不到），于是报 i/o timeout。
+    pull_policy: build
+    container_name: pa-agent
+    restart: unless-stopped
+    env_file:
+      - /opt/pa-agent/.env
+    environment:
+      # 容器内时区：K线时间戳按 UTC 对齐，但日志与记录文件名用本地时间
+      TZ: Asia/Shanghai
+      # 轮询间隔（秒）。交易所限频：Binance 现货 1200 权重/分钟，
+      # 20 秒一次 klines(权重 2) 完全安全。
+      PA_DAEMON_POLL_INTERVAL: "20"
+      # 两次分析之间的最小间隔（秒），防止 K 线抖动导致连续烧 token
+      PA_DAEMON_ANALYSIS_COOLDOWN: "120"
+      # 只在 K 线收盘后才分析（推荐 true）
+      PA_DAEMON_WAIT_BAR_CLOSE: "true"
+    volumes:
+      - /opt/pa-agent/config:/app/config                    # settings.json
+      - /opt/pa-agent/logs:/app/logs                        # pa_agent.log
+      - /opt/pa-agent/trade_records:/app/trade_records      # 交易记录 + 下单流水
+      - /opt/pa-agent/records:/app/records                  # 每次分析的完整记录
+    # 收到 SIGTERM 后给守护进程 30 秒收尾（把统计写完再退）
+    stop_grace_period: 30s
+    # 只想跑一轮就退出（调试用）：覆盖 command
+    # command: ["--once"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

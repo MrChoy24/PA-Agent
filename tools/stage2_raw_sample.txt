@@ -1,0 +1,139 @@
+ {
+  "decision": {
+    "order_direction": null,
+    "order_type": "不下单",
+    "entry_price": null,
+    "take_profit_price": null,
+    "stop_loss_price": null,
+    "reasoning": "阶段一确认 cycle_position=trending_tr，direction=bearish偏弱，HTF为多头回调阶段。进入阶段二后，结构分支走§6区间逻辑：当前K6-K1价格在4528-4540窄幅横盘，K线高度重叠，EMA20平坦并与价格纠缠，符合Barbwire特征（区间宽约12点，紧凑度极高）。按§6.4规则，Barbwire中不交易，需等待尖峰级别突破。\n\n入场信号检查（§9）：K1为最近K线，收盘位置在4528-4540区间内部，无明确方向性信号棒，既不是区间下边界的看涨反转棒，也不是上边界的看跌信号棒。9.2方向一致性不满足。\n\n即使勉强识别信号，§10.1止损位置不明确（区间内部无法锁定信号棒极点为结构化止损），且§14禁止行为中"在区间中部入场"和"在极端交易区间中交易"均被触发。\n\n激进档位在此场景下：gate_result=proceed，趋势方向偏空，但Barbwire触发§14硬性禁止项（在极端密集区间中交易），即使激进档也必须不下单。等待价格以尖峰形式突破4518支撑（空头确立）或站稳4540/EMA附近（多头反弹），届时再评估下单。",
+    "diagnosis_confidence": 62,
+    "diagnosis_confidence_reasoning": "trending_tr与normal_channel特征重叠，K6-K1横盘接近Barbwire使周期位置判断有歧义；HTF多头与局部空头方向不一致，信号部分矛盾，维持阶段一62分。",
+    "trade_confidence": 32,
+    "trade_confidence_reasoning": "K6-K1为Barbwire结构，方向完全不明；当前价格在区间中部，无有效信号棒，止损无法明确设置；HTF反对激进做空；§14硬性禁止项触发，决策置信度极低，仅32分。",
+    "estimated_win_rate": null,
+    "estimated_win_rate_reasoning": "order_type=不下单，§10.3未通过（止损无法明确，Barbwire禁止交易），不估算胜率。",
+    "key_factors": [
+      "K6-K1形成Barbwire：价格在4528-4540约12点区间高度重叠，紧凑度极高",
+      "EMA20平坦并与价格纠缠，方向信号缺失",
+      "K3低点4518为近期关键支撑，尚未跌破",
+      "HTF（K100-K20）多头背景，局部做空逆HTF",
+      "§14触发：区间中部入场 + 近似极端交易区间"
+    ],
+    "watch_points": [
+      "若价格以3根以上强空头趋势棒跌破4518，空头通道确立，可评估Low1/Low2做空机会",
+      "若价格以3根以上强多头趋势棒突破4540并站稳EMA，可评估回踩EMA做多机会",
+      "突破后必须等待回踩测试成功再入场，不追第一根突破棒"
+    ],
+    "risk_assessment": "当前Barbwire结构中任何方向入场接近抛硬币，扣除滑点手续费后期望为负。HTF多头背景使做空风险额外偏高。等待结构明确是唯一合理选择。",
+    "invalidation_condition": "若价格在Barbwire中继续横盘超过10根K线且无方向选择，重新评估是否退出观察；若出现尖峰突破后回踩失败，放弃该方向交易思路。"
+  },
+  "diagnosis_summary": {
+    "cycle_position": "trending_tr",
+    "direction": "bearish",
+    "key_signals": [
+      "K61-K22大幅上冲后价格自4571高点回落，形成下跌波段",
+      "EMA20由上倾转为下倾（4548→4535），价格持续运行在EMA下方",
+      "K6-K1价格在4528-4540窄幅震荡，Barbwire特征，方向不明",
+      "K3低点4518为近期关键支撑，尚未有效跌破",
+      "HTF（K100-K20）多头背景，当前为回调阶段"
+    ]
+  },
+  "decision_trace": [
+    {
+      "node_id": "6.1",
+      "section": "交易区间",
+      "question": "是否存在清晰上下边界？",
+      "answer": "是",
+      "reason": "trending_tr结构：上边界约4540（K22高点区域，多次测试），下边界约4518（K3低点），边界各有2次以上测试；EMA20平坦，价格反复穿越；K线重叠度高",
+      "skipped": false,
+      "bar_range": "K22-K1"
+    },
+    {
+      "node_id": "6.2",
+      "section": "交易区间",
+      "question": "是否为普通交易区间还是趋势型交易区间？",
+      "answer": "是",
+      "reason": "判断为trending_tr：EMA20微向下倾斜，低点有轻微下移趋势，有弱空头方向偏好；但每个波段仍可反转，区间属性主导",
+      "skipped": false,
+      "bar_range": "K22-K1",
+      "branch": "trending_tr，空头方向偏好约60%，做空顺势优先"
+    },
+    {
+      "node_id": "6.3",
+      "section": "交易区间",
+      "question": "当前价格是否在区间边界？",
+      "answer": "否",
+      "reason": "K1收盘约4528-4530，位于区间下边界4518与上边界4540之间的中部偏下区域，但K6-K1整体横盘在4528-4540，价格不在边界而在区间内部",
+      "skipped": false,
+      "bar_range": "K6-K1"
+    },
+    {
+      "node_id": "6.4",
+      "section": "交易区间",
+      "question": "是否出现Barbwire/极窄区间？",
+      "answer": "是",
+      "reason": "K6-K1共6根K线高度重叠，价格在4528-4540约12点范围内反复振荡；区间宽度/平均波段幅度约12/35≈34%，接近Barbwire标准（<30%）；EMA20平坦并与价格纠缠；买卖双方力量完全平衡，方向不明。按规则：不在Barbwire中交易，等待尖峰级别突破。",
+      "skipped": false,
+      "bar_range": "K6-K1"
+    },
+    {
+      "node_id": "9.1",
+      "section": "入场信号",
+      "question": "信号K线是否已经收盘？",
+      "answer": "否",
+      "reason": "K1为最近K线，即使已收盘，其收盘位置在Barbwire区间内部（约4528），不构成有效方向性信号棒；无法识别边界处的反转信号棒",
+      "skipped": false,
+      "bar_range": "K1"
+    },
+    {
+      "node_id": "9.2",
+      "section": "入场信号",
+      "question": "信号K线方向是否与计划方向一致？",
+      "answer": "否",
+      "reason": "K1在Barbwire内部，既非区间下边界的看涨反转棒（做多），也非上边界的看跌信号棒（做空）；方向一致性不满足，无法判定有效入场信号",
+      "skipped": false,
+      "bar_range": "K1"
+    },
+    {
+      "node_id": "10.1",
+      "section": "风险收益",
+      "question": "是否能明确止损？",
+      "answer": "否",
+      "reason": "当前价格在Barbwire内部，无有效信号棒极点可作为结构化止损依据；区间内部任何位置设置止损均缺乏结构支撑，止损无法明确",
+      "skipped": false,
+      "bar_range": "K6-K1"
+    },
+    {
+      "node_id": "10.2",
+      "section": "风险收益",
+      "question": "止损是否过大？",
+      "answer": "不适用",
+      "reason": "10.1已判定止损无法明确，跳过10.2",
+      "skipped": true,
+      "bar_range": "K6-K1"
+    },
+    {
+      "node_id": "10.3",
+      "section": "风险收益",
+      "question": "交易者方程是否通过？",
+      "answer": "否",
+      "reason": "止损无法明确（10.1=否），entry/stop/target均无法确立，交易者方程无法计算；即使强行估算，Barbwire中胜率约50%，扣除滑点手续费后期望为负，方程不通过",
+      "skipped": false,
+      "bar_range": "K6-K1"
+    },
+    {
+      "node_id": "14",
+      "section": "禁止行为清单",
+      "question": "是否触犯禁止行为？",
+      "answer": "是",
+      "reason": "触犯以下条款：(1)在极端交易区间（Barbwire）中交易——K6-K1为高度重叠的紧凑区间，任意入场接近抛硬币；(2)在区间中部入场——当前价格不在边界而在区间内部；(3)交易者方程不通过仍下单——10.3已判定否。激进档位亦不可逾越硬性禁止项，判定不下单。",
+      "skipped": false,
+      "bar_range": "K6-K1"
+    }
+  ],
+  "terminal": {
+    "node_id": "14",
+    "outcome": "reject",
+    "label": "触犯§14禁止行为（Barbwire中交易+区间中部入场+交易者方程不通过），不下单，等待尖峰级别突破4518或4540后回踩测试再评估"
+  }
+}

@@ -1,0 +1,77 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pa-agent"
+version = "0.1.0"
+description = "Price Action AI assistant: Binance/OKX kline data, two-stage LLM analysis (AGPL-3.0)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "AGPL-3.0-or-later" }
+authors = [{ name = "PA Agent Team" }]
+dependencies = [
+    "PyQt6>=6.6",
+    "pyqtgraph>=0.13",
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "openai>=1.40",
+    "tiktoken>=0.7",
+    "jsonschema>=4.22",
+    "pydantic>=2.7",
+    "cryptography>=42",
+    "pywin32>=306; sys_platform == 'win32'",
+    "akshare>=1.14",
+    "baostock>=0.8",
+    "curl_cffi>=0.13",
+    "tushare>=1.4",
+    "httpx[socks]>=0.27",
+]
+
+[project.optional-dependencies]
+# 免费 A 股行情替补源（东财失效时的后备；纯 HTTP 无需任何依赖）
+# zzshare 为托管 API，pip 安装后即可免 Key 使用，可选
+ashare-fallback = [
+    "zzshare",
+]
+dev = [
+    "pytest>=8",
+    "pytest-qt>=4.4",
+    "hypothesis>=6",
+    "ruff>=0.5",
+    "black>=24.4",
+]
+
+[project.scripts]
+pa-agent = "pa_agent.main:main"
+pa-daemon = "pa_agent.daemon.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["pa_agent*"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+extend-select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+# The app is PyQt6-only (see dependencies + all imports). Without this,
+# pytest-qt auto-detects and may pick PySide6 when both bindings are installed,
+# making isinstance(widget, QWidget) fail inside qtbot.addWidget.
+qt_api = "pyqt6"
+markers = [
+    "unit: unit-level tests",
+    "property: property-based tests (hypothesis)",
+    "integration: integration tests crossing module boundaries",
+    "e2e: end-to-end smoke tests",
+    "live: requires real API key via environment variable (never uses config/settings.json)",
+]

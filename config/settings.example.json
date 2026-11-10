@@ -1,0 +1,87 @@
+{
+  "provider": {
+    "model": "deepseek-flash",
+    "base_url": "https://api.deepseek.com",
+    "api_key_encrypted": "",
+    "thinking": true,
+    "reasoning_effort": "low",
+    "context_window": 128000,
+    "fallbacks": [],
+    "backup_glm_api_key": ""
+  },
+  "general": {
+    "analysis_bar_count": 100,
+    "refresh_interval_ms": 1000,
+    "context_warning_threshold_pct": 99999999.0,
+    "last_data_source": "binance",
+    "last_symbol": "BTCUSDT",
+    "last_timeframe": "15m",
+    "decision_flow_auto_play": true,
+    "decision_flow_play_seconds": 50,
+    "incremental_max_new_bars": 10,
+    "decision_stance": "balanced",
+    "decision_confidence_threshold": 0,
+    "structure_flip_cooldown_bars": 3,
+    "decision_flow_default_zoom_pct": 600,
+    "stream_pane_font_pt": 11,
+    "chart_seq_label_font_pt": 11,
+    "auto_resume_chart_after_analysis": true,
+    "enable_next_bar_prediction": false
+  },
+  "prompt": {
+    "stage2_load_full_strategy_library": false,
+    "experience_max_entries": 0,
+    "experience_max_chars_per_entry": 400,
+    "stage1_inject_pattern_briefs": true
+  },
+  "validation": {
+    "normalization_mode": "strict",
+    "trace_semantic_checks": true,
+    "strict_bar_by_bar_features": true,
+    "disable_truncation_repair": true
+  },
+  "pushplus": {
+    "enabled": false,
+    "token": ""
+  },
+  "dingtalk": {
+    "enabled": false,
+    "webhook_url": "",
+    "secret": "",
+    "at_mobiles": [],
+    "at_all": false,
+    "notify_on_order_only": true,
+    "msg_type": "markdown"
+  },
+  "binance": {
+    "api_key": "",
+    "api_secret": "",
+    "testnet": false
+  },
+  "okx": {
+    "api_key": "",
+    "api_secret": "",
+    "passphrase": "",
+    "demo": false
+  },
+  "auto_trade": {
+    "enabled": false,
+    "dry_run": true,
+    "venue": "binance",
+    "min_confidence": 60,
+    "max_notional_usdt": 50.0,
+    "max_daily_orders": 10,
+    "allowed_symbols": [],
+    "require_stop_loss": true,
+    "market_type": "spot",
+    "margin_per_trade_usdt": 10.0,
+    "leverage": 1,
+    "order_type": "MARKET",
+    "margin_mode": "isolated",
+    "max_price_deviation_pct": 0.3
+  },
+  "tushare": {
+    "token": ""
+  },
+  "ai_backups": []
+}

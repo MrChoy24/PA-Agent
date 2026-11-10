@@ -1,0 +1,26 @@
+# 无头守护进程的运行时依赖（服务器 / Docker 专用）
+#
+# 和 pyproject.toml 的 dependencies 相比，这里**刻意不含**：
+#   PyQt6, pyqtgraph, pywin32  —— 服务器没有图形界面
+#   akshare, baostock, tushare, curl_cffi —— A股数据源，守护进程只用 Binance/OKX
+#   pandas / numpy —— 非 GUI 代码里没有模块级依赖，只有 trade_logger 画图时才用到
+#
+# 想保留「交易记录 CSV 旁附带 K 线 PNG」的话，解开下面 matplotlib 的注释。
+
+# HTTP 客户端（Binance / OKX / 钉钉 / PushPlus 共用）
+httpx[socks]>=0.27
+
+# 配置与校验
+pydantic>=2.7
+jsonschema>=4.22
+
+# LLM 客户端（openai 在 pa_agent/ai/deepseek_client.py 里是惰性导入，
+# 但真正调模型时必须有）
+openai>=1.40
+tiktoken>=0.7
+
+# 凭据加密（config/settings.py 的 api_key_encrypted 通道）
+cryptography>=42
+
+# 可选：让 trade_records/ 里的交易记录附带 K 线截图
+# matplotlib>=3.8

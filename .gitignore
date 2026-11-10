@@ -1,0 +1,141 @@
+# =============================================================================
+# PA Agent — 仅上传源代码与项目文档；本地运行数据、密钥、临时文件不入库
+# =============================================================================
+
+# ── Python / 构建产物 ─────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.hypothesis/
+
+# ── 密钥与本地配置（切勿提交）────────────────────────────────────────────────
+.env
+.env.*
+config/settings.json
+config/settings.json.*
+config/settings.local.json
+config/settings.local.json.*
+config/exception_state.json
+config/secret.key
+config/secret.key.*
+config/tv_symbol_aliases.json
+config/feishu.json
+config/feishu.json.*
+# 任何以常见备份后缀结尾的本地文件（含凭据副本）
+*.bak
+*.bak_*
+*.backup
+*.orig
+*.tmp
+*.pem
+*.key
+
+# ── 运行时数据（分析记录、经验库、日志、交易导出）────────────────────────────
+logs/*
+!logs/.gitkeep
+
+records/**/*
+!records/**/
+!records/**/.gitkeep
+
+experience/**/*
+!experience/**/
+!experience/**/.gitkeep
+
+trade_records/*
+!trade_records/.gitkeep
+
+# ── 本地临时 / 解包产物（WorkBuddy、网关调试等）──────────────────────────────
+_tmp_wb_asar/
+_tmp_auth.js
+auth.js
+index.js
+
+# ── 根目录杂项：个人笔记、封面图、一次性脚本 ─────────────────────────────────
+# 本地启动脚本（Windows 专用，含本机路径，不入库）
+start_pa_agent.bat
+/*.jpeg
+/*.jpg
+/*.png
+videoCover-*
+*_fix_*.md
+remove_*.md
+tasks.json
+fix_garbage_line.py
+分析*.md
+MAC*.txt
+*部署*.txt
+*智能体*.txt
+!MAC版本智能体部署方法.txt
+!把这个扔给龙虾-智能体部署方法.txt
+
+# ── uv 缓存目录 ────────────────────────────────────────────────────────────────
+.uv/
+
+# ── IDE / Agent 本地目录 ─────────────────────────────────────────────────────
+.idea/
+.vscode/
+.cursor/
+.kiro/
+
+# ── tools 目录下的本地诊断输出（保留 .py 脚本本身）──────────────────────────
+tools/_pending_order_report.txt
+tools/stage2_raw_sample.txt
+tools/_tools_catalog.json
+tools/_diag_*.txt
+
+# ── 个人开发笔记（非对外文档）────────────────────────────────────────────────
+docs/changelog/
+
+# ── 本地配置备份与凭据副本（主配置已忽略，备份也必须忽略）────────────────────
+/config/settings.json.*
+/config/settings.local.json.*
+/config/feishu.json.*
+/config/secret.key.*
+/config/*.bak
+/config/*.bak_*
+/config/*.backup
+
+# ── 文档目录下逐次运行产生的截图/结果（可再生成，只入库结论文档）──────────────
+/docs/**/cycle_preview_*/
+/docs/**/final_display_*/
+/docs/**/live_*/
+
+
+# ── Agent 会话资料与本地研究输出（保留可复现脚本、测试与正式文档）─────────────
+/.workbuddy/
+/research/sensenova_fallback/runs/
+/research/sensenova_fallback/independent_review/
+/research/sensenova_fallback/agent_task.md
+/research/sensenova_fallback/agent_result.md
+/research/sensenova_fallback/agent_review_task.md
+/research/sensenova_fallback/agent_review_result.md
+/research/sensenova_fallback/delegation_transcript.md
+/research/sensenova_fallback/ACCEPTANCE.html
+/research/pa_validation/_figs/
+
+# 日志应完整保存在本地，但不提交到源码仓库
+*.log
+
+# ── OS ───────────────────────────────────────────────────────────────────────
+Thumbs.db
+Desktop.ini
+.DS_Store
+config/ark_rotation_state.json
+config/README.md
+research/pa_validation/README.md
+
+# ── 开源必须包含的模板与文档（覆盖上面的宽泛规则）────────────────────────────
+# .env.example 是服务器部署的唯一变量清单，纯空占位，必须入库
+!.env.example
+# 配置字段说明文档，不含任何凭据
+!config/README.md
+# 单元测试依赖的 stage2 原始报文样本（tests/unit/test_json_validator.py）
+!tools/stage2_raw_sample.txt

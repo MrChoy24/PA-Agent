@@ -1,0 +1,79 @@
+"""glm-4-flash backup channel for the SenseNova / Ark gateways.
+
+Only active when the primary base_url is the SenseNova token gateway or the
+Volcengine Ark gateway. The key comes from the user's settings
+(`provider.backup_glm_api_key`), never from source code or the repository.
+"""
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+GLM_MODEL = "glm-4-flash"
+GLM_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
+
+logger = logging.getLogger(__name__)
+
+
+def _is_sensenova(base_url: str | None) -> bool:
+    from pa_agent.ai.sensenova_fallback import is_sensenova_fallback_eligible
+
+    return is_sensenova_fallback_eligible(base_url)
+
+
+def is_ark_base(base_url: str | None) -> bool:
+    """额外网关也允许配置该备用链路。"""
+    from pa_agent.ai.ark_gateway import is_ark_base as _ark
+
+    return _ark(base_url)
+
+
+def is_glm_backup_eligible(base_url: str | None) -> bool:
+    """GLM 备用 Key 输入框何时显示：主通道为 SenseNova 或火山方舟。"""
+    return _is_sensenova(base_url) or is_ark_base(base_url)
+
+
+def ensure_glm_fallback(provider: Any) -> bool:
+    """Attach the glm-4-flash fallback when SenseNova/Ark + a GLM key are present.
+
+    Returns True when a fallback entry was appended. Idempotent for the entry
+    itself, but the stored key always tracks ``provider.backup_glm_api_key``:
+    settings.json keeps a materialised copy of the chain, so a rotated key in
+    the input box must overwrite the stale copy — otherwise every request keeps
+    using the old key and fails with 401.
+    """
+    if provider is None or not is_glm_backup_eligible(getattr(provider, "base_url", "")):
+        return False
+    key = str(getattr(provider, "backup_glm_api_key", "") or "").strip()
+    if not key:
+        return False
+    fallbacks = list(getattr(provider, "fallbacks", None) or [])
+    for cand in fallbacks:
+        if (str(getattr(cand, "model", "")).strip() == GLM_MODEL
+                and str(getattr(cand, "base_url", "")).strip() == GLM_BASE_URL):
+            if str(getattr(cand, "api_key", "") or "").strip() != key:
+                # 用户换了 Key：设置里保存的备用链是落盘快照，必须跟着刷新。
+                cand.api_key = key
+                from pa_agent.util.mask_secret import mask_secret
+
+                logger.info("备用链路 Key 已更新为当前配置（%s）", mask_secret(key))
+            return False
+    from pa_agent.config.settings import AIProviderSettings
+
+    fallbacks.append(AIProviderSettings(
+        model=GLM_MODEL, base_url=GLM_BASE_URL, api_key=key,
+        thinking=False, reasoning_effort="low",
+    ))
+    provider.fallbacks = fallbacks
+    return True
+
+
+def is_sensenova_base(base_url: str | None) -> bool:
+    """Public helper for the settings UI (kept for backward compatibility)."""
+    return _is_sensenova(base_url)
+
+
+def glm_fallback_available(provider: Any) -> bool:
+    """True when the GLM key is set and the primary gateway supports a backup."""
+    return (is_glm_backup_eligible(getattr(provider, "base_url", ""))
+            and bool(str(getattr(provider, "backup_glm_api_key", "") or "").strip()))
