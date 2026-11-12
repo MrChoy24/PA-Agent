@@ -76,12 +76,122 @@ def extra_fallbacks(settings: Any) -> list[Any]:
     return out
 
 
+#: 环境变量名：在 ``.env`` 里直接写备用池，免去改 settings.json / 重开容器配置。
+FALLBACK_SPEC_ENV = "PA_AGENT_FALLBACKS"
+
+#: 单条备用的字段分隔符与条目分隔符。用 ``|`` 与 ``;`` 是因为它们不会出现在
+#: base_url / model 里，也不像逗号那样被 shell 或 compose 当成列表语法。
+_FIELD_SEP = "|"
+_ENTRY_SEP = ";"
+
+#: api_key 字段写这个值 = 复用主通道的 Key（同网关下多个模型共用一个 Key 的常见情况）。
+_KEY_REUSE_MARKERS = frozenset({"", "-", "*", "same", "reuse"})
+
+
+def parse_fallback_spec(text: Any, *, default_key: str = "") -> tuple[list[Any], list[str]]:
+    """把 ``.env`` 里的备用池字符串解析成完整的 provider 配置列表。
+
+    格式（条目之间用 ``;``，字段之间用 ``|``）::
+
+        name|model|base_url|api_key; name|model|base_url|api_key
+
+    * ``name`` 可省略（留空则用 model 当显示名）。
+    * ``api_key`` 写 ``-`` / 留空 / 省略，表示复用主通道的 Key。
+    * 无法解析或字段不足的条目会被跳过并返回在第二个返回值里。
+
+    返回 ``(entries, problems)``。``problems`` 只含可直接打印给人看的短句，
+    不含 Key。
+    """
+    from pa_agent.config.settings import AIProviderSettings
+
+    raw = str(text or "").strip()
+    if not raw:
+        return [], []
+
+    entries: list[Any] = []
+    problems: list[str] = []
+    for index, chunk in enumerate(raw.split(_ENTRY_SEP), start=1):
+        item = chunk.strip()
+        if not item:
+            continue
+        parts = [p.strip() for p in item.split(_FIELD_SEP)]
+        # 允许 3 字段（无 Key）与 4 字段两种写法。
+        if len(parts) < 3:
+            problems.append(f"第 {index} 条字段不足（至少要 name|model|base_url）")
+            continue
+        name, model, base_url = parts[0], parts[1], parts[2]
+        key_field = parts[3] if len(parts) > 3 else ""
+        if not model or not base_url:
+            problems.append(f"第 {index} 条缺少 model 或 base_url")
+            continue
+        api_key = default_key if key_field.lower() in _KEY_REUSE_MARKERS else key_field
+        if not api_key:
+            problems.append(f"第 {index} 条没有可用 api_key（也没有主通道 Key 可复用）")
+            continue
+        entry = AIProviderSettings(
+            name=name or model,
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            thinking=True,
+            reasoning_effort="low",
+            enabled=True,
+        )
+        entries.append(normalize_entry(entry))
+    return entries, problems
+
+
+def env_fallbacks(*, default_key: str = "") -> list[Any]:
+    """``PA_AGENT_FALLBACKS`` 里声明的备用池（服务器上改一行即可生效）。
+
+    没有该变量时返回空列表，因此不设它的部署行为完全不变。
+    解析失败只写 WARNING，绝不让启动失败 —— 一个拼错的备用池不该
+    把整个守护进程卡死。
+    """
+    import logging
+    import os
+
+    log = logging.getLogger(__name__)
+    raw = str(os.environ.get(FALLBACK_SPEC_ENV, "") or "").strip()
+    if not raw:
+        return []
+    entries, problems = parse_fallback_spec(raw, default_key=default_key)
+    for problem in problems:
+        log.warning("%s 配置有误，已跳过：%s", FALLBACK_SPEC_ENV, problem)
+    if entries:
+        log.info(
+            "%s 提供了 %d 条备用接口：%s",
+            FALLBACK_SPEC_ENV,
+            len(entries),
+            ", ".join(str(getattr(e, "name", "") or e.model) for e in entries),
+        )
+    return entries
+
+
 def combined_fallback_chain(provider: Any, settings: Any = None) -> list[Any]:
     """派生链 + 用户自定义备用，按顺序去重合并。
 
     ``provider.fallbacks`` 在前（方舟池、GLM），用户自定义项接在后面，
     这样「主通道 → 方舟池 → GLM → 我的备用 → 免费池」的顺序是稳定的。
+
+    用户自定义部分有两个来源，``.env`` 的 ``PA_AGENT_FALLBACKS`` 优先于
+    settings.json 的 ``ai_backups``：服务器上改一行环境变量比重挂配置文件省事。
     """
+    # 环境变量里写了备用池就以它为准，整段替换（派生链与 ai_backups 都不再参与）。
+    # 理由：用户既然在 .env 里列了清单，链上再混进 settings.json 的旧条目，
+    # 现场就没人说得清最终顺序了。
+    env_entries = env_fallbacks(default_key=str(getattr(provider, "api_key", "") or "").strip())
+    if env_entries:
+        chain: list[Any] = []
+        seen: set[tuple[str, str]] = set()
+        for item in env_entries:
+            key = entry_key(item)
+            if key in seen or not key[0] or not key[1]:
+                continue
+            seen.add(key)
+            chain.append(item)
+        return chain
+
     chain: list[Any] = []
     seen: set[tuple[str, str]] = set()
     for item in list(getattr(provider, "fallbacks", None) or []):

@@ -47,6 +47,10 @@ _REFRESH_LOOP_JOIN_MS = 0
 # there is no reason to block the GUI thread waiting for them to finish.
 _SNAPSHOT_WORKER_JOIN_MS = 0
 
+# 工具栏「实际使用的模型」徽标的刷新间隔。刷新只是读取进程内的一个小列表，
+# 1 秒一次的开销可以忽略；再慢就看不出降级过程了。
+_MODEL_TRACE_REFRESH_MS = 1000
+
 
 def _format_price(price: float) -> str:
     """格式化价格：大数加千分位、小币自适应小数位。"""
@@ -635,7 +639,14 @@ class MainWindow(QMainWindow):
 
         self._ai_mode_label = QLabel("")
         self._ai_mode_label.setObjectName("mutedLabel")
+        self._ai_mode_label.setTextFormat(Qt.TextFormat.PlainText)
         ctrl_layout.addWidget(self._ai_mode_label)
+        # 徽标每秒钟从 model_trace 拉一次「本轮实际用到的模型」：方舟会轮换、
+        # 主通道失败还会沿备用链切换，只在设置保存时刷新是看不到真实情况的。
+        self._ai_mode_timer = QTimer(self)
+        self._ai_mode_timer.setInterval(_MODEL_TRACE_REFRESH_MS)
+        self._ai_mode_timer.timeout.connect(self._refresh_model_trace_label)
+        self._ai_mode_timer.start()
 
         outer_layout.addLayout(ctrl_layout)
 
@@ -4415,62 +4426,70 @@ class MainWindow(QMainWindow):
             flow_viz.schedule_refit_view()
 
     def _update_ai_mode_label(self) -> None:
-        """Show current thinking / reasoning_effort / model in the toolbar."""
+        """Keep the legacy entry point: the badge is driven by the trace now."""
+        self._refresh_model_trace_label()
+
+    def _refresh_model_trace_label(self) -> None:
+        """Render「本轮实际使用的模型」into the toolbar badge.
+
+        数据来自 ``pa_agent.ai.model_trace``：每次真正发出去的请求都会记一条，
+        所以方舟轮换、主通道失败后切到备用链的过程都能在徽标上看见，而不是像
+        以前那样只显示设置里填的那个模型名。
+        """
+        label = getattr(self, "_ai_mode_label", None)
+        if label is None:
+            return
         settings = getattr(self._ctx, "settings", None)
         if settings is None:
-            self._ai_mode_label.setText("")
+            label.setText("")
             return
-        p = settings.provider
-        base = (p.base_url or "").lower()
-        self._ai_mode_label.setToolTip("")
-        if "deepseek.com" in base:
-            thinking = "开" if p.thinking else "关"
-            self._ai_mode_label.setText(
-                f"思考: {thinking} · effort={p.reasoning_effort} · {p.model}"
-            )
-        elif "kkone.vip" in base:
-            thinking = "开" if p.thinking else "关"
-            effort = p.reasoning_effort if p.thinking else "—"
-            self._ai_mode_label.setText(
-                f"KKAI 思考: {thinking} · budget≈{effort} · {p.model}"
-            )
-        elif "yunwu.ai" in base:
-            thinking = "开" if p.thinking else "关"
-            effort = p.reasoning_effort if p.thinking else "—"
-            mode = "adaptive" if "opus-4-7" in p.model or "opus-4-6" in p.model else "effort"
-            self._ai_mode_label.setText(
-                f"云雾 思考: {thinking} · {mode}={effort} · {p.model}"
-            )
-        elif "packyapi.com" in base:
-            thinking = "开" if p.thinking else "关"
-            effort = p.reasoning_effort if p.thinking else "—"
-            mode = "adaptive" if "opus-4-7" in p.model or "opus-4-6" in p.model else "effort"
-            self._ai_mode_label.setText(
-                f"PackyAPI 思考: {thinking} · {mode}={effort} · {p.model}"
-            )
-        elif "volces.com" in base or "volcengine" in base:
-            # 火山方舟：模型每轮分析轮换一次，这里显示的是「上次用的」模型；
-            # 模型名按别名表翻译，避免工具栏出现过长的真实 ID。
-            # effort 显示实际下发的值（方舟固定 low，忽略设置里的 high/max）。
-            from pa_agent.ai.ark_gateway import (
-                ARK_ROTATION_POOL,
-                ARK_THINKING_EFFORT,
-                resolve_ark_model,
-            )
+        try:
+            from pa_agent.ai.model_trace import snapshot as _trace_snapshot
 
-            thinking = "开" if p.thinking else "关"
-            effort = ARK_THINKING_EFFORT if p.thinking else "—"
-            self._ai_mode_label.setText(
-                f"方舟 思考: {thinking} · {effort} · {resolve_ark_model(p.model)}"
+            snap = _trace_snapshot()
+        except Exception:  # noqa: BLE001 - 徽标不能影响主流程
+            snap = {"attempts": [], "latest": None, "count": 0, "models": []}
+
+        attempts = snap.get("attempts") or []
+        latest = snap.get("latest") or None
+        provider = getattr(settings, "provider", None)
+        configured = str(getattr(provider, "model", "") or "")
+
+        if not attempts:
+            label.setText(f"模型: {configured} · 等待请求…")
+            label.setToolTip(
+                "尚未发起请求。分析开始后这里显示本轮真正发出去的模型名。\n"
+                f"设置里配置的模型：{configured}"
             )
-            self._ai_mode_label.setToolTip(
-                f"火山方舟网关，共 {len(ARK_ROTATION_POOL)} 个模型轮换使用；"
-                "额度用完会自动切到下一个模型。"
-            )
-        else:
-            self._ai_mode_label.setText(
-                f"模型: {p.model} · 思考={('开' if p.thinking else '关')}"
-            )
+            return
+
+        model = str(latest.get("model") or "") or configured
+        ok = latest.get("ok")
+        source = str(latest.get("source") or "primary")
+        tries = int(snap.get("count") or 0)
+
+        suffix = ""
+        if source == "spare":
+            suffix = " · 备用链路"
+        elif tries > 1:
+            suffix = f" · 第 {tries} 次尝试"
+        if ok is False:
+            suffix += " · 失败"
+        elif ok is True and tries > 1:
+            suffix += " · 成功"
+        label.setText(f"实际模型: {model}{suffix}")
+
+        lines = ["本轮分析的模型尝试（新→旧）："]
+        for idx, item in enumerate(reversed(attempts), start=1):
+            flag = "成功" if item.get("ok") is True else ("失败" if item.get("ok") is False else "进行中")
+            host = str(item.get("base_url") or "")
+            host = host.split("//", 1)[-1].split("/", 1)[0] if host else ""
+            src = "备用" if str(item.get("source")) == "spare" else "主通道"
+            lines.append(f"{idx}. {item.get('model')} · {src} · {flag}" + (f" · {host}" if host else ""))
+        if configured and configured != model:
+            lines.append("")
+            lines.append(f"设置里配置的模型：{configured}（方舟/备用链会从池中轮换）")
+        label.setToolTip("\n".join(lines))
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 

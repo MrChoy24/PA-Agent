@@ -296,6 +296,88 @@ def test_auto_trade_env_rejects_unknown_venue(monkeypatch: pytest.MonkeyPatch) -
 
 
 
+def test_auto_trade_env_overrides_order_sizing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """杠杆 / 开单金额 / 订单类型都能从 .env 下来（服务器部署的核心诉求）。"""
+    from pa_agent.daemon.config import apply_auto_trade_env_overrides
+
+    settings = Settings()
+    monkeypatch.setenv("PA_DAEMON_MARGIN_PER_TRADE", "10")
+    monkeypatch.setenv("PA_DAEMON_MAX_NOTIONAL", "20")
+    monkeypatch.setenv("PA_DAEMON_LEVERAGE", "10")
+    monkeypatch.setenv("PA_DAEMON_MARKET_TYPE", "futures")
+    monkeypatch.setenv("PA_DAEMON_ORDER_TYPE", "limit")
+    monkeypatch.setenv("PA_DAEMON_MARGIN_MODE", "cross")
+
+    applied = apply_auto_trade_env_overrides(settings)
+
+    assert settings.auto_trade.margin_per_trade_usdt == 10.0
+    assert settings.auto_trade.max_notional_usdt == 20.0
+    assert settings.auto_trade.leverage == 10
+    assert settings.auto_trade.market_type == "futures"
+    assert settings.auto_trade.order_type == "LIMIT"
+    assert settings.auto_trade.margin_mode == "cross"
+    assert set(applied) == {
+        "PA_DAEMON_MARGIN_PER_TRADE",
+        "PA_DAEMON_MAX_NOTIONAL",
+        "PA_DAEMON_LEVERAGE",
+        "PA_DAEMON_MARKET_TYPE",
+        "PA_DAEMON_ORDER_TYPE",
+        "PA_DAEMON_MARGIN_MODE",
+    }
+
+
+def test_auto_trade_env_rejects_out_of_range_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """非法值必须被忽略并保留原配置，不能污染风控。"""
+    from pa_agent.daemon.config import apply_auto_trade_env_overrides
+
+    settings = Settings()
+    settings.auto_trade.leverage = 3
+    settings.auto_trade.margin_per_trade_usdt = 7.0
+    monkeypatch.setenv("PA_DAEMON_LEVERAGE", "500")
+    monkeypatch.setenv("PA_DAEMON_MARGIN_PER_TRADE", "-5")
+    monkeypatch.setenv("PA_DAEMON_MARKET_TYPE", "margin")
+    monkeypatch.setenv("PA_DAEMON_ORDER_TYPE", "STOP")
+    monkeypatch.setenv("PA_DAEMON_MARGIN_MODE", "portfolio")
+    monkeypatch.setenv("PA_DAEMON_MAX_NOTIONAL", "abc")
+
+    applied = apply_auto_trade_env_overrides(settings)
+
+    assert settings.auto_trade.leverage == 3
+    assert settings.auto_trade.margin_per_trade_usdt == 7.0
+    assert settings.auto_trade.market_type == "spot"
+    assert settings.auto_trade.order_type == "MARKET"
+    assert settings.auto_trade.margin_mode == "isolated"
+    assert applied == []
+
+
+def test_auto_trade_env_cannot_loosen_safety_ceilings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """风控上限（置信度 / 每日单数 / 止损）刻意不开放环境变量通道。"""
+    from pa_agent.daemon.config import apply_auto_trade_env_overrides
+
+    settings = Settings()
+    before = (
+        settings.auto_trade.min_confidence,
+        settings.auto_trade.max_daily_orders,
+        settings.auto_trade.require_stop_loss,
+    )
+    monkeypatch.setenv("PA_DAEMON_MIN_CONFIDENCE", "0")
+    monkeypatch.setenv("PA_DAEMON_MAX_DAILY_ORDERS", "999")
+    monkeypatch.setenv("PA_DAEMON_REQUIRE_STOP_LOSS", "false")
+
+    apply_auto_trade_env_overrides(settings)
+
+    after = (
+        settings.auto_trade.min_confidence,
+        settings.auto_trade.max_daily_orders,
+        settings.auto_trade.require_stop_loss,
+    )
+    assert after == before
+
+
 # ── event bus ───────────────────────────────────────────────────────────────
 
 
@@ -535,3 +617,204 @@ def test_daemon_package_does_not_import_pyqt6() -> None:
     finally:
         builtins.__import__ = real_import
     assert hits == []
+
+
+# ── 配置来源可诊断（用户改 .env 却「没生效」时的定位依据）─────────────────
+
+
+def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in (
+        "PA_DAEMON_DATA_SOURCE",
+        "PA_DAEMON_SYMBOL",
+        "PA_DAEMON_TIMEFRAME",
+        "PA_DAEMON_BAR_COUNT",
+        "PA_DAEMON_POLL_INTERVAL",
+        "PA_DAEMON_ANALYSIS_COOLDOWN",
+        "PA_DAEMON_WAIT_BAR_CLOSE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_describe_sources_marks_env_overrides(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """改了 .env 里的周期，来源必须显示 env —— 否则用户无从判断是否读到。"""
+    _clean_env(monkeypatch)
+    monkeypatch.setenv("PA_DAEMON_TIMEFRAME", "30m")
+    monkeypatch.setenv("PA_DAEMON_POLL_INTERVAL", "45")
+
+    cfg = DaemonConfig.from_env(settings_path=tmp_path / "settings.json")
+
+    assert cfg.timeframe == "30m"
+    assert cfg.bar_seconds == 1800
+    assert cfg.sources["timeframe"] == "env"
+    assert cfg.sources["poll_interval_s"] == "env"
+    text = cfg.describe_sources()
+    assert "timeframe=env" in text
+    assert "poll_interval_s=env" in text
+
+
+def test_describe_sources_falls_back_to_settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """没设 env 时，来源标成 settings，而不是默认值 —— 两者含义完全不同。"""
+    _clean_env(monkeypatch)
+    path = tmp_path / "settings.json"
+    path.write_text(
+        json.dumps({"general": {"last_timeframe": "4h", "last_symbol": "BTCUSDT"}}),
+        encoding="utf-8",
+    )
+
+    cfg = DaemonConfig.from_env(settings_path=path)
+
+    assert cfg.timeframe == "4h"
+    assert cfg.sources["timeframe"] == "settings"
+    assert cfg.sources["symbol"] == "settings"
+    # 这个没配过，应落在默认值上。
+    assert cfg.sources["poll_interval_s"] == "default"
+
+
+def test_cli_override_wins_and_is_reported(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """CLI 优先级最高，来源要能看出是被 CLI 覆盖的。"""
+    _clean_env(monkeypatch)
+    monkeypatch.setenv("PA_DAEMON_TIMEFRAME", "30m")
+
+    cfg = DaemonConfig.from_env(
+        settings_path=tmp_path / "settings.json",
+        overrides={"timeframe": "1h"},
+    )
+
+    assert cfg.timeframe == "1h"
+    assert cfg.sources["timeframe"] == "cli"
+    assert "cli_overrides=timeframe" in cfg.describe_sources()
+
+
+def test_describe_shows_dingtalk_on_when_env_provides_webhook(monkeypatch: pytest.MonkeyPatch) -> None:
+    """settings 里 enabled=False，但 .env 提供了 webhook：实际会发，日志必须说 on。
+
+    真实日志（2026-11-12 容器）：describe() 打 `dingtalk=off`，
+    同一轮末尾却是「钉钉下单信号发送成功」，自相矛盾，让运维误判通知坏了。
+    """
+    cfg = _config()
+    cfg.settings.dingtalk.enabled = False
+    cfg.settings.dingtalk.webhook_url = ""
+    cfg.settings.dingtalk.secret = ""
+    monkeypatch.setenv("DINGTALK_WEBHOOK_URL", "https://oapi.dingtalk.com/robot/send?access_token=abc")
+    monkeypatch.setenv("DINGTALK_SECRET", "SECabc")
+
+    assert "dingtalk=on" in cfg.describe()
+
+
+def test_describe_shows_dingtalk_off_without_any_webhook(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _config()
+    cfg.settings.dingtalk.enabled = False
+    cfg.settings.dingtalk.webhook_url = ""
+    cfg.settings.dingtalk.secret = ""
+    monkeypatch.delenv("DINGTALK_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("DINGTALK_SECRET", raising=False)
+
+    assert "dingtalk=off" in cfg.describe()
+
+
+def test_compose_does_not_shadow_dotenv_keys() -> None:
+    """compose 的 environment 优先级高于 env_file。
+
+    曾经两个 compose 都硬写了 PA_DAEMON_POLL_INTERVAL /
+    PA_DAEMON_ANALYSIS_COOLDOWN / PA_DAEMON_WAIT_BAR_CLOSE，
+    用户在 .env 里怎么改都不会生效。这里把这条红线钉死。
+    """
+    root = Path(__file__).resolve().parents[2]
+    shadowing = (
+        "PA_DAEMON_POLL_INTERVAL",
+        "PA_DAEMON_ANALYSIS_COOLDOWN",
+        "PA_DAEMON_WAIT_BAR_CLOSE",
+    )
+    for name in ("docker-compose.yml", "docker-compose.1panel.yml"):
+        text = (root / name).read_text(encoding="utf-8")
+        # 只看非注释行：注释里提到这些名字是允许且必要的说明。
+        live = [
+            line
+            for line in text.splitlines()
+            if not line.lstrip().startswith("#")
+        ]
+        for key in shadowing:
+            offenders = [line for line in live if key in line]
+            assert offenders == [], f"{name} 仍然硬写了 {key}：{offenders}"
+
+
+def test_dotenv_files_use_lf_line_endings() -> None:
+    """CRLF 会被 docker 的 env_file 解析器带进值里（如 '30m\\r'）。
+
+    代码层 _env_str 会 strip()，但 compose env_file 与别家工具未必，
+    统一成 LF 才稳。
+    """
+    root = Path(__file__).resolve().parents[2]
+    for name in (".env", ".env.example"):
+        path = root / name
+        if not path.exists():
+            continue
+        assert b"\r\n" not in path.read_bytes(), f"{name} 含 CRLF 行尾"
+
+
+# ── graceful stop ────────────────────────────────────────────────────────────
+
+
+class _CancelAwareOrchestrator:
+    """卡在一次分析里，直到 cancel_token 被点掉才抛 CancelledError。"""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.token_seen: Any = None
+
+    def submit(self, frame, cancel_token, on_event, **kwargs):
+        from pa_agent.ai.deepseek_client import CancelledError
+
+        self.calls += 1
+        self.token_seen = cancel_token
+        raise CancelledError("cancelled by test")
+
+
+def test_request_stop_cancels_the_inflight_analysis_token() -> None:
+    """docker stop 只置 _stop 没用：正在跑的 AI 请求也必须能中断。"""
+    from pa_agent.util.threading import CancelToken
+
+    runner = _runner_with(_make_bars(140), {})
+    token = CancelToken()
+    runner._cancel_token = token  # type: ignore[attr-defined]
+
+    runner.request_stop()
+
+    assert runner.stopped is True
+    assert token.is_set() is True
+
+
+def test_request_stop_is_safe_without_an_inflight_analysis() -> None:
+    runner = _runner_with(_make_bars(140), {})
+    assert runner._cancel_token is None  # type: ignore[attr-defined]
+    runner.request_stop()
+    assert runner.stopped is True
+
+
+def test_tick_reports_cancelled_instead_of_raising() -> None:
+    """取消不是异常：tick 要返回 ran=False / reason=已取消。"""
+    runner = _runner_with(_make_bars(140), {})
+    runner._orchestrator = _CancelAwareOrchestrator()  # type: ignore[attr-defined]
+
+    outcome = runner.tick(force=True)
+
+    assert outcome.ran is False
+    assert outcome.reason == "已取消"
+    assert runner._cancel_token is None  # type: ignore[attr-defined]
+
+
+def test_tick_still_raises_ordinary_errors() -> None:
+    """非取消类异常不能被吞掉，否则轮询循环看不到数据源故障。"""
+
+    class _Boom:
+        calls = 0
+
+        def submit(self, frame, cancel_token, on_event, **kwargs):
+            self.calls += 1
+            raise RuntimeError("boom")
+
+    runner = _runner_with(_make_bars(140), {})
+    runner._orchestrator = _Boom()  # type: ignore[attr-defined]
+
+    with pytest.raises(RuntimeError, match="boom"):
+        runner.tick(force=True)

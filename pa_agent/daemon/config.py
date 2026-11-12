@@ -150,6 +150,62 @@ def apply_provider_env_overrides(settings: Settings) -> list[str]:
     return applied
 
 
+def _notify_active(channel: str, settings: Settings) -> bool:
+    """通知通道是否真的会发出去（含环境变量兜底的 webhook/token）。
+
+    ``settings.<channel>.enabled`` 只反映配置文件。两个通道都允许用环境变量
+    提供 webhook/token（见 ``pa_agent/notify/*_notifier.py``），此时
+    ``*_is_active()`` 会把它视为已启用。日志若只看 settings，就会出现
+    「dingtalk=off」却在同一轮推送成功的自相矛盾记录。
+    """
+    try:
+        if channel == "dingtalk":
+            from pa_agent.notify.dingtalk_notifier import dingtalk_is_active
+
+            return bool(dingtalk_is_active(settings))
+        from pa_agent.notify.pushplus_notifier import pushplus_is_active
+
+        return bool(pushplus_is_active(settings))
+    except Exception:  # noqa: BLE001 - 通知模块不可用时退回配置值
+        section = getattr(settings, channel, None)
+        return bool(getattr(section, "enabled", False))
+
+
+def apply_fallback_env_overrides(settings: Settings) -> list[str]:
+    """把 ``.env`` 里的 ``PA_AGENT_FALLBACKS`` 解析成备用池。
+
+    环境变量里写了备用池就**整段替换** ``settings.ai_backups``（而不是追加）：
+    .env 是服务器上唯一该被手改的地方，若它和文件里的条目混在一起，用户改完
+    根本说不清最终链是什么。不设该变量则完全不动 settings.json 的内容。
+
+    返回被应用的变量名（供启动日志打印来源），绝不返回 Key。
+    """
+    from pa_agent.ai.extra_providers import FALLBACK_SPEC_ENV, parse_fallback_spec
+
+    raw = str(os.environ.get(FALLBACK_SPEC_ENV, "") or "").strip()
+    if not raw:
+        return []
+    entries, problems = parse_fallback_spec(
+        raw, default_key=str(settings.provider.api_key or "").strip()
+    )
+    for problem in problems:
+        logger.warning("%s %s，已跳过", FALLBACK_SPEC_ENV, problem)
+    if not entries:
+        logger.warning(
+            "%s 已设置但没有任何可解析的条目，继续使用 settings.json 里的备用池",
+            FALLBACK_SPEC_ENV,
+        )
+        return []
+    settings.ai_backups = entries
+    logger.info(
+        "%s 覆盖了备用池：%d 条（%s）",
+        FALLBACK_SPEC_ENV,
+        len(entries),
+        ", ".join(str(getattr(e, "name", "") or e.model) for e in entries),
+    )
+    return [FALLBACK_SPEC_ENV]
+
+
 def apply_exchange_env_overrides(settings: Settings) -> list[str]:
     """Overlay Binance / OKX credentials from environment variables.
 
@@ -198,11 +254,18 @@ def apply_exchange_env_overrides(settings: Settings) -> list[str]:
 
 
 def apply_auto_trade_env_overrides(settings: Settings) -> list[str]:
-    """Overlay the three auto-trade switches that matter on a server.
+    """Overlay the auto-trade switches and order sizing from the environment.
 
-    Deliberately limited to ``enabled`` / ``dry_run`` / ``venue``: the numeric
-    risk limits stay in settings.json so they cannot be loosened by a typo in
-    an env file without anyone noticing.
+    Switches (``enabled`` / ``dry_run`` / ``venue``) plus the *order sizing*
+    fields the user configures on the panel — margin per trade, leverage,
+    order type, market type, margin mode, notional cap. Every value is
+    validated: an out-of-range or unrecognised entry is logged and ignored
+    instead of silently loosening risk controls.
+
+    Hard safety ceilings are **not** overridable from the environment
+    (``min_confidence``, ``max_daily_orders``, ``require_stop_loss``,
+    ``allowed_symbols``, ``max_price_deviation_pct``): those are the last
+    line of defence, and a typo in ``.env`` must not be able to disable them.
     """
     applied: list[str] = []
     auto = settings.auto_trade
@@ -221,6 +284,87 @@ def apply_auto_trade_env_overrides(settings: Settings) -> list[str]:
         else:
             logger.warning(
                 "环境变量 PA_DAEMON_VENUE=%r 无效（只能是 binance / okx），已忽略", venue
+            )
+
+    # 每单保证金（合约逐仓模式下的下单金额，单位 USDT）
+    margin = str(os.environ.get("PA_DAEMON_MARGIN_PER_TRADE", "") or "").strip()
+    if margin:
+        try:
+            value = float(margin)
+        except ValueError:
+            logger.warning("环境变量 PA_DAEMON_MARGIN_PER_TRADE=%r 不是数字，已忽略", margin)
+        else:
+            if value > 0:
+                auto.margin_per_trade_usdt = value
+                applied.append("PA_DAEMON_MARGIN_PER_TRADE")
+            else:
+                logger.warning(
+                    "环境变量 PA_DAEMON_MARGIN_PER_TRADE=%r 必须大于 0，已忽略", margin
+                )
+
+    # 名义金额上限（现货 / 全仓模式下的下单金额，单位 USDT）
+    notional = str(os.environ.get("PA_DAEMON_MAX_NOTIONAL", "") or "").strip()
+    if notional:
+        try:
+            value = float(notional)
+        except ValueError:
+            logger.warning("环境变量 PA_DAEMON_MAX_NOTIONAL=%r 不是数字，已忽略", notional)
+        else:
+            if value > 0:
+                auto.max_notional_usdt = value
+                applied.append("PA_DAEMON_MAX_NOTIONAL")
+            else:
+                logger.warning(
+                    "环境变量 PA_DAEMON_MAX_NOTIONAL=%r 必须大于 0，已忽略", notional
+                )
+
+    # 杠杆倍数（1~125，与面板 OrderParamsBar 一致）
+    leverage = str(os.environ.get("PA_DAEMON_LEVERAGE", "") or "").strip()
+    if leverage:
+        try:
+            value = int(float(leverage))
+        except ValueError:
+            logger.warning("环境变量 PA_DAEMON_LEVERAGE=%r 不是整数，已忽略", leverage)
+        else:
+            if 1 <= value <= 125:
+                auto.leverage = value
+                applied.append("PA_DAEMON_LEVERAGE")
+            else:
+                logger.warning(
+                    "环境变量 PA_DAEMON_LEVERAGE=%r 超出 1~125，已忽略", leverage
+                )
+
+    market = str(os.environ.get("PA_DAEMON_MARKET_TYPE", "") or "").strip().lower()
+    if market:
+        if market in ("spot", "futures"):
+            auto.market_type = market
+            applied.append("PA_DAEMON_MARKET_TYPE")
+        else:
+            logger.warning(
+                "环境变量 PA_DAEMON_MARKET_TYPE=%r 无效（只能是 spot / futures），已忽略",
+                market,
+            )
+
+    order_type = str(os.environ.get("PA_DAEMON_ORDER_TYPE", "") or "").strip().upper()
+    if order_type:
+        if order_type in ("MARKET", "LIMIT"):
+            auto.order_type = order_type
+            applied.append("PA_DAEMON_ORDER_TYPE")
+        else:
+            logger.warning(
+                "环境变量 PA_DAEMON_ORDER_TYPE=%r 无效（只能是 MARKET / LIMIT），已忽略",
+                order_type,
+            )
+
+    margin_mode = str(os.environ.get("PA_DAEMON_MARGIN_MODE", "") or "").strip().lower()
+    if margin_mode:
+        if margin_mode in ("isolated", "cross"):
+            auto.margin_mode = margin_mode
+            applied.append("PA_DAEMON_MARGIN_MODE")
+        else:
+            logger.warning(
+                "环境变量 PA_DAEMON_MARGIN_MODE=%r 无效（只能是 isolated / cross），已忽略",
+                margin_mode,
             )
 
     return applied
@@ -254,6 +398,11 @@ class DaemonConfig:
 
     log_level: str = "INFO"
 
+    #: 每个配置项最终取自哪里：``env`` / ``cli`` / ``settings`` / ``default``。
+    #: 用户在服务器上改完 .env 却「没生效」时，这张表就是唯一能看到真相的地方，
+    #: 所以它必须跟着配置一起打印出来，而不是让人去猜。
+    sources: dict[str, str] = field(default_factory=dict)
+
     @property
     def bar_seconds(self) -> int:
         return _timeframe_seconds(self.timeframe)
@@ -271,15 +420,52 @@ class DaemonConfig:
         path = Path(settings_path) if settings_path is not None else SETTINGS_JSON_PATH
         settings = load_settings(path)
         applied_env = apply_provider_env_overrides(settings)
+        applied_env += apply_fallback_env_overrides(settings)
         applied_env += apply_exchange_env_overrides(settings)
         applied_env += apply_auto_trade_env_overrides(settings)
         if applied_env:
             logger.info("已从环境变量覆盖配置：%s", ", ".join(applied_env))
         general = settings.general
 
-        data_source = _env_str("PA_DAEMON_DATA_SOURCE", str(general.last_data_source or ""))
-        symbol = _env_str("PA_DAEMON_SYMBOL", str(general.last_symbol or DEFAULT_SYMBOL))
-        timeframe = _env_str("PA_DAEMON_TIMEFRAME", str(general.last_timeframe or DEFAULT_TIMEFRAME))
+        # 每一项都记下来源：改 .env 却没生效时，与其让用户猜，不如直接打印。
+        sources: dict[str, str] = {}
+
+        def _pick(field_name: str, env_name: str, settings_value: Any, default: Any) -> Any:
+            """env > settings.json > 内置默认值，并记录最终来源。"""
+            raw = str(os.environ.get(env_name, "") or "").strip()
+            if raw:
+                sources[field_name] = "env"
+                return raw
+            if settings_value:
+                sources[field_name] = "settings"
+                return settings_value
+            sources[field_name] = "default"
+            return default
+
+        data_source = str(
+            _pick(
+                "data_source",
+                "PA_DAEMON_DATA_SOURCE",
+                str(general.last_data_source or ""),
+                "",
+            )
+        )
+        symbol = str(
+            _pick(
+                "symbol",
+                "PA_DAEMON_SYMBOL",
+                str(general.last_symbol or ""),
+                DEFAULT_SYMBOL,
+            )
+        )
+        timeframe = str(
+            _pick(
+                "timeframe",
+                "PA_DAEMON_TIMEFRAME",
+                str(general.last_timeframe or ""),
+                DEFAULT_TIMEFRAME,
+            )
+        )
 
         cfg = cls(
             settings=settings,
@@ -299,7 +485,24 @@ class DaemonConfig:
                 int(general.incremental_max_new_bars or 10),
             ),
             log_level=_env_str("PA_DAEMON_LOG_LEVEL", "INFO").upper(),
+            sources=sources,
         )
+
+        # 剩下这些只有 env / 默认值两层，来源同样记下来。
+        for field_name, env_name in (
+            ("bar_count", "PA_DAEMON_BAR_COUNT"),
+            ("poll_interval_s", "PA_DAEMON_POLL_INTERVAL"),
+            ("analysis_cooldown_s", "PA_DAEMON_ANALYSIS_COOLDOWN"),
+            ("skip_duplicate_bars", "PA_DAEMON_SKIP_DUPLICATE"),
+            ("wait_bar_close", "PA_DAEMON_WAIT_BAR_CLOSE"),
+            ("analyze_on_start", "PA_DAEMON_ANALYZE_ON_START"),
+            ("incremental", "PA_DAEMON_INCREMENTAL"),
+            ("incremental_threshold", "PA_DAEMON_INCREMENTAL_THRESHOLD"),
+            ("log_level", "PA_DAEMON_LOG_LEVEL"),
+        ):
+            has_env = bool(str(os.environ.get(env_name, "") or "").strip())
+            sources.setdefault(field_name, "env" if has_env else "default")
+
         if overrides:
             for key, value in overrides.items():
                 if value is None:
@@ -307,6 +510,8 @@ class DaemonConfig:
                 if not hasattr(cfg, key):
                     raise ConfigError(f"未知配置项：{key}")
                 setattr(cfg, key, value)
+                if key in sources or key in ("symbol", "timeframe", "data_source"):
+                    sources[key] = "cli"
         cfg.validate()
         return cfg
 
@@ -352,12 +557,19 @@ class DaemonConfig:
         return bool(getattr(self.settings.auto_trade, "enabled", False))
 
     def describe(self) -> str:
-        """One-line summary for the startup log (never contains secrets)."""
+        """One-line summary for the startup log (never contains secrets).
+
+        ``dingtalk`` / ``pushplus`` 刻意走通知模块自己的判定（``*_is_active``），
+        而不是只看 ``settings.*.enabled``：这两个通道都支持用环境变量提供
+        webhook/token（见 ``pa_agent/notify/*_notifier.py``），此时 enabled
+        会由 env 兜底置真。只看 settings 会打出「dingtalk=off」却在同一轮
+        里成功推送，日志自相矛盾。
+        """
         auto = self.settings.auto_trade
         venue = str(getattr(auto, "venue", "binance") or "binance")
         dry = bool(getattr(auto, "dry_run", True))
-        ding = "on" if getattr(self.settings.dingtalk, "enabled", False) else "off"
-        push = "on" if getattr(self.settings.pushplus, "enabled", False) else "off"
+        ding = "on" if _notify_active("dingtalk", self.settings) else "off"
+        push = "on" if _notify_active("pushplus", self.settings) else "off"
         return (
             f"source={self.data_source} symbol={self.symbol} tf={self.timeframe} "
             f"bars={self.bar_count} poll={self.poll_interval_s:g}s "
@@ -365,6 +577,34 @@ class DaemonConfig:
             f"auto_trade={'on(' + venue + (', dry-run)' if dry else ', LIVE)') if auto.enabled else 'off'} "
             f"dingtalk={ding} pushplus={push}"
         )
+
+    def describe_sources(self) -> str:
+        """Which layer each key setting came from (env / cli / settings / default).
+
+        用户改了 .env 却看不到效果时，这行日志能直接指出两件事：
+        容器是不是根本没读到新变量（显示 settings），
+        或者读到了但被别处覆盖了。
+        """
+        if not self.sources:
+            return ""
+        wanted = (
+            "data_source",
+            "symbol",
+            "timeframe",
+            "bar_count",
+            "poll_interval_s",
+            "analysis_cooldown_s",
+            "wait_bar_close",
+        )
+        parts = [
+            f"{name}={self.sources.get(name, '?')}"
+            for name in wanted
+            if name in self.sources
+        ]
+        cli = [name for name, src in self.sources.items() if src == "cli"]
+        if cli:
+            parts.append("cli_overrides=" + ",".join(sorted(cli)))
+        return "配置来源：" + " ".join(parts)
 
 
 def _timeframe_seconds(timeframe: str) -> int:

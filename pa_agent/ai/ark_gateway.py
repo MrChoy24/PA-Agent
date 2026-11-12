@@ -95,11 +95,16 @@ def next_rotation_model(state_path: Path | None = None) -> str:
 
 
 def is_account_level_error(exc: BaseException | str | None) -> bool:
-    """True for账号级故障（欠费/冻结/**凭据失效**）：换同一网关的模型也没用。
+    """True for账号级故障（欠费/冻结/余额不足/**凭据失效**）：换模型或重试都没用。
 
     火山方舟欠费时对**所有**模型返回 403 ``AccountOverdueError``；Key 被删除、
     过期或复制错时会返回 401 ``AuthenticationError: The API key doesn't exist``。
-    两种情况都只跟账号/凭据有关，逐个换模型只会白跑十几秒，应直接跳到后续链路。
+    智谱 bigmodel 余额不足时更隐蔽：HTTP 状态码是 **429**，响应体才是真相
+    ``{"error":{"code":"1113","message":"余额不足或无可用资源包,请充值。"}}``。
+    若只按 429 当限流处理，每个阶段会白等 5/10/20/40/80 秒（≈155 秒）再放弃，
+    表现出来就是「一直显示正在分析、永不结束」。
+
+    两种情况都只跟账号/凭据有关，重试与逐个换模型都不会好转，应立刻切备用链路。
     """
     msg = (str(exc) if exc is not None else "").lower()
     if any(
@@ -109,6 +114,14 @@ def is_account_level_error(exc: BaseException | str | None) -> bool:
             "overdue balance",
             "account has been suspended",
             "arrear",
+            # 余额/额度耗尽：智谱 1113、部分网关的 billing 文案。
+            "余额不足",
+            "无可用资源包",
+            "请充值",
+            "no available resource package",
+            "insufficient balance",
+            "billing",
+            "payment required",
         )
     ):
         return True

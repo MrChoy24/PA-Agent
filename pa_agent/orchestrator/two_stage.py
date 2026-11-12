@@ -450,6 +450,12 @@ class TwoStageOrchestrator:
         """
         # ── Step 0: 本次分析使用的候选（不修改用户在设置里填的模型）──
         self._active_provider = None
+        try:
+            from pa_agent.ai.model_trace import reset as _trace_reset
+
+            _trace_reset()
+        except Exception:  # noqa: BLE001 - 记录器故障不能影响分析
+            pass
         self._apply_ark_rotation()
 
         # ── Step 1: Build partial record ──────────────────────────────────────
@@ -1570,6 +1576,20 @@ class TwoStageOrchestrator:
 
             raise CancelledError("Request cancelled before SenseNova free fallback")
 
+        from pa_agent.ai.sensenova_fallback import prompt_exceeds_free_window
+
+        if prompt_exceeds_free_window(messages):
+            # 免费候选的上下文窗口只有 8k~32k，而本项目的两阶段提示词实测
+            # 7~10 万 tokens：数学上就装不进去。以前是等主接口失败后才在这里
+            # 撞一次 finish_reason=length（实测白等 45 秒以上），现在开跑前
+            # 直接按体积判掉，一个请求都不发。
+            logger.debug(
+                "SenseNova free fallback skipped for %s: prompt cannot fit the free "
+                "candidates' context window",
+                stage,
+            )
+            return None
+
         logger.debug(
             "SenseNova free fallback triggered for %s (base_url eligible) reason=%s",
             stage,
@@ -1595,7 +1615,9 @@ class TwoStageOrchestrator:
                 getattr(reply, "reasoning_content", None) or "",
             )
             if stage == "stage1":
-                return self._accept_fallback_stage1(result, content)
+                # 契约不满足时不再立刻退成本地规则：那会让第一个候选"看起来成功"，
+                # 后面的候选根本没机会被尝试。返回失败让循环换下一个。
+                return result
             return self._accept_fallback_stage2_quality(result, content)
 
         try:
@@ -1976,6 +1998,12 @@ class TwoStageOrchestrator:
             return False
         cur = self._provider()
         tried_keys.add((str(cur.base_url or "").strip(), str(cur.model or "").strip()))
+        # 刚刚失败的这一条先记账：接下来 10 分钟它排到链尾，
+        # 免得每个新的分析周期都从同一条挂掉的通道重新撞起。
+        from pa_agent.ai import fallback_health
+
+        fallback_health.mark_failed(cur)
+        fallbacks = fallback_health.reorder(fallbacks)
         for cand in fallbacks:
             key = (str(cand.base_url or "").strip(), str(cand.model or "").strip())
             if key in tried_keys:
@@ -2003,6 +2031,11 @@ class TwoStageOrchestrator:
                 )
                 continue
             self._active_provider = cand
+            # 换上去之后先假定可用：真跑挂了会在下一轮再次 mark_failed。
+            # 这样一条已恢复的通道能立刻回到链路前部。
+            from pa_agent.ai import fallback_health
+
+            fallback_health.mark_ok(cand)
             # 同一网关内换模型（如方舟额度用完换下一个）仍是同一套协议，
             # 内部实现细节：不输出渠道信息。
             same_gateway = (

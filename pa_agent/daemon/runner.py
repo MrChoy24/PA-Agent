@@ -68,6 +68,9 @@ class DaemonRunner:
         self._orchestrator: Any = None
         self._pending_writer: Any = None
         self._exp_reader: Any = None
+        #: 当前这一轮分析的取消令牌。停止信号要能中断正在跑的 AI 请求，
+        #: 否则 docker stop 的宽限期一到就只能 SIGKILL（会留下部分记录）。
+        self._cancel_token: Any = None
         self._last_analyzed_bar_ts: float | None = None
         self._last_analysis_monotonic: float = 0.0
         self._consecutive_errors = 0
@@ -82,6 +85,15 @@ class DaemonRunner:
         if not self._stop.is_set():
             logger.info("收到停止信号，等待当前轮询结束…")
         self._stop.set()
+        # 正在跑的 AI 分析可能要好几分钟；只置 _stop 是没用的（tick 期间不检查它），
+        # 必须把这一轮的 cancel_token 也点掉，让请求立刻中断并落盘已有结果。
+        token = self._cancel_token
+        if token is not None and not token.is_set():
+            logger.info("已请求中断当前分析…")
+            try:
+                token.set()
+            except Exception:  # noqa: BLE001 - 停止流程绝不能再抛
+                logger.debug("取消令牌置位失败（忽略）", exc_info=True)
 
     @property
     def stopped(self) -> bool:
@@ -190,6 +202,11 @@ class DaemonRunner:
     def run_forever(self) -> None:
         cfg = self._cfg
         logger.info("守护进程启动：%s", cfg.describe())
+        # 紧跟一行「这些值是从哪来的」：用户改 .env 不生效时，第一眼就能看出
+        # 是容器没读到变量（显示 settings/default），还是被别处覆盖了。
+        _sources = cfg.describe_sources()
+        if _sources:
+            logger.info("%s", _sources)
         if cfg.auto_trade_enabled():
             auto = cfg.settings.auto_trade
             if bool(getattr(auto, "dry_run", True)):
@@ -346,6 +363,8 @@ class DaemonRunner:
 
         cfg = self._cfg
         cancel_token = CancelToken()
+        # 交给信号处理器：docker stop 时能中断这一轮，而不是被 SIGKILL 硬切。
+        self._cancel_token = cancel_token
 
         previous_record = None
         incremental_new_bar_count: int | None = None
@@ -375,13 +394,31 @@ class DaemonRunner:
         def _on_event(event: OrchestratorEvent) -> None:
             logger.debug("orchestrator event: %s", event.name)
 
-        record = self._orchestrator.submit(
-            frame,
-            cancel_token,
-            _on_event,
-            previous_record=previous_record,
-            incremental_new_bar_count=incremental_new_bar_count,
-        )
+        record = None
+        try:
+            record = self._orchestrator.submit(
+                frame,
+                cancel_token,
+                _on_event,
+                previous_record=previous_record,
+                incremental_new_bar_count=incremental_new_bar_count,
+            )
+        except Exception as exc:  # noqa: BLE001 - 取消要单独处理，其余照常上报
+            from pa_agent.ai.deepseek_client import CancelledError
+            from pa_agent.ai.sensenova_fallback import is_cancel_or_interrupt
+
+            if cancel_token.is_set() or isinstance(exc, CancelledError) or is_cancel_or_interrupt(exc):
+                logger.info("分析已按停止请求中断（已保存到目前的结果）")
+                outcome = AnalysisOutcome(
+                    ran=False,
+                    reason="已取消",
+                    bar_ts_open=bar_ts_open,
+                )
+                self._last_outcome = outcome
+                return outcome
+            raise
+        finally:
+            self._cancel_token = None
 
         self._analyses += 1
         self._last_analysis_monotonic = time.monotonic()
@@ -661,6 +698,9 @@ class DaemonRunner:
         cfg = self._cfg
         print("=" * 66)
         print(f"PA Agent 守护进程自检  ·  {cfg.describe()}")
+        _sources = cfg.describe_sources()
+        if _sources:
+            print(_sources)
         print("-" * 66)
         if ok:
             print("结果：健康 ✅")

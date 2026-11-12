@@ -278,6 +278,46 @@ def _is_truncation_error(exc: BaseException) -> bool:
     return "truncated" in str(exc).lower()
 
 
+#: 免费候选的实际上下文窗口。它们全是 8k~32k 级别的小模型，而本项目的两阶段
+#: 提示词实测 7~10 万 tokens，根本装不下。免费池对此的唯一防御是真撞一次
+#: ``finish_reason=length`` 之后记 30 分钟（见 :func:`mark_prompt_too_large`），
+#: 那一次实测要等 60~140 秒。这里改成开跑前先用本地估算挡住，把这段等待归零。
+_FREE_CONTEXT_WINDOW_TOKENS = 32768
+
+
+def estimate_prompt_tokens(messages: Iterable[dict[str, Any]] | None) -> int:
+    """Rough token count for *messages* without importing tiktoken.
+
+    只用于「这份提示词明显超出免费候选窗口」这种量级判断，不需要精确：
+    CJK 按 1 token/字、ASCII 按 4 字符/token 估算，对中英混排偏保守（高估），
+    正好符合这里「宁可少试一次也不白等两分钟」的取向。
+    """
+    total = 0
+    for msg in messages or ():
+        if not isinstance(msg, dict):
+            continue
+        total += 4
+        for value in msg.values():
+            if not isinstance(value, str) or not value:
+                continue
+            ascii_chars = sum(1 for ch in value if ord(ch) < 128)
+            total += (len(value) - ascii_chars) + ascii_chars // 4 + 1
+    return total + 2
+
+
+def prompt_exceeds_free_window(
+    messages: Iterable[dict[str, Any]] | None,
+    *,
+    max_tokens: int = _DEFAULT_MAX_TOKENS,
+) -> bool:
+    """True when the prompt cannot fit any free candidate's context window.
+
+    命中时调用方应直接放弃免费链路——不是「这一轮运气不好」，而是这份提示词
+    在数学上就装不进 8k~32k 的窗口，轮换多少个候选都只会各烧一次超时。
+    """
+    return estimate_prompt_tokens(messages) > _FREE_CONTEXT_WINDOW_TOKENS - max_tokens
+
+
 def is_cancel_or_interrupt(exc: BaseException) -> bool:
     """True for user cancel / KeyboardInterrupt (must not be swallowed)."""
     if isinstance(exc, (KeyboardInterrupt, SystemExit)):
@@ -559,6 +599,9 @@ def _to_ai_reply(
     from pa_agent.ai.deepseek_client import AIReply, AIUsage
 
     content, reasoning = _extract_message_text(payload)
+    from pa_agent.ai.model_trace import record as _trace_record
+
+    _trace_record(candidate.model, candidate.base_url, ok=True, source="spare")
     usage_raw = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
     usage = AIUsage(
         prompt_tokens=int(usage_raw.get("prompt_tokens") or 0),
@@ -1003,6 +1046,25 @@ def run_free_stage_fallback(
             message=(
                 "previous prompts of this size exceeded the free candidates' "
                 f"max_tokens budget ({_DEFAULT_MAX_TOKENS} output tokens)"
+            ),
+        )
+
+    if prompt_exceeds_free_window(messages):
+        # 开跑前就用本地估算挡住：这份提示词在数学上装不进免费候选的窗口，
+        # 轮换候选只会每个各烧一次超时（实测每候选 60~140 秒）。顺手记下结论，
+        # 让同一进程里后续阶段直接跳过。
+        logger.info(
+            "SenseNova free fallback skipped: prompt (~%d tokens est.) cannot fit "
+            "the free candidates' context window (%d tokens) — not attempting",
+            estimate_prompt_tokens(messages),
+            _FREE_CONTEXT_WINDOW_TOKENS,
+        )
+        mark_prompt_too_large()
+        return FreeStageFailure(
+            attempts=[],
+            message=(
+                "prompt cannot fit the free candidates' context window "
+                f"({_FREE_CONTEXT_WINDOW_TOKENS} tokens)"
             ),
         )
 

@@ -434,3 +434,244 @@ def test_mimo_chat_patches_tool_call_messages_before_send() -> None:
 
     sent_messages = mock_openai.return_value.chat.completions.create.call_args.kwargs["messages"]
     assert sent_messages[1]["reasoning_content"] == ""
+
+
+def test_openai_client_is_reused_across_calls():
+    """同一 (base_url, api_key) 不该每次请求都重建 client（TLS + DNS 全重来）。"""
+    settings = _make_settings()
+    client = DeepSeekClient(settings)
+
+    created: list[dict] = []
+
+    class _Completions:
+        def create(self, **kwargs):
+            return _make_mock_response()
+
+    class _FakeOpenAI:
+        def __init__(self, **kwargs):
+            created.append(kwargs)
+            self.chat = MagicMock(completions=_Completions())
+
+    with patch("pa_agent.ai.deepseek_client._OpenAI", _FakeOpenAI):
+        client.chat([{"role": "user", "content": "hi"}])
+        client.chat([{"role": "user", "content": "hi again"}])
+
+    assert len(created) == 1, created
+
+
+def test_openai_client_cache_is_keyed_by_credentials():
+    """换 api_key 必须拿到新 client，不能复用旧凭据的连接。"""
+    client = DeepSeekClient(_make_settings(api_key="sk-one"))
+
+    created: list[dict] = []
+
+    class _Completions:
+        def create(self, **kwargs):
+            return _make_mock_response()
+
+    class _FakeOpenAI:
+        def __init__(self, **kwargs):
+            created.append(kwargs)
+            self.chat = MagicMock(completions=_Completions())
+
+    with patch("pa_agent.ai.deepseek_client._OpenAI", _FakeOpenAI):
+        client.chat([{"role": "user", "content": "hi"}])
+        client.update_provider(_make_settings(api_key="sk-two"))
+        client.chat([{"role": "user", "content": "hi"}])
+
+    assert len(created) == 2, created
+    assert {c["api_key"] for c in created} == {"sk-one", "sk-two"}
+
+
+# ---------------------------------------------------------------------------
+# NVIDIA NIM (integrate.api.nvidia.com)
+# ---------------------------------------------------------------------------
+
+_NVIDIA_BASE = "https://integrate.api.nvidia.com/v1"
+
+
+def _nvidia_settings(model: str = "stepfun-ai/step-5-preview") -> AIProviderSettings:
+    return AIProviderSettings(
+        model=model,
+        base_url=_NVIDIA_BASE,
+        api_key="nvapi-test",
+        thinking=True,
+        reasoning_effort="low",
+    )
+
+
+def test_is_nvidia_matches_only_its_own_gateway():
+    from pa_agent.ai.deepseek_client import _is_nvidia
+
+    assert _is_nvidia(_NVIDIA_BASE) is True
+    assert _is_nvidia("https://open.bigmodel.cn/api/paas/v4") is False
+    assert _is_nvidia("https://api.scnet.cn/api/llm/v1") is False
+    assert _is_nvidia("https://api.deepseek.com") is False
+
+
+def test_nvidia_max_tokens_is_capped_below_the_silent_timeout():
+    """384000 会让 NVIDIA 请求挂到客户端超时，必须夹到 65536。"""
+    from pa_agent.ai.deepseek_client import (
+        _NVIDIA_MAX_OUTPUT_TOKENS,
+        _provider_max_output_tokens,
+    )
+
+    assert _provider_max_output_tokens(_nvidia_settings()) == _NVIDIA_MAX_OUTPUT_TOKENS
+    assert _NVIDIA_MAX_OUTPUT_TOKENS == 65_536
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "stepfun-ai/step-5-preview",
+        "z-ai/glm-5.3-flash",
+        "deepseek-ai/deepseek-v4.1-flash",
+        "mistralai/mistral-large-4-1t-a52b",
+    ],
+)
+def test_nvidia_never_sends_thinking_field(model: str):
+    """NVIDIA 不认 thinking（传 adaptive 直接 400），任何模型都不能带。"""
+    from pa_agent.ai.deepseek_client import _resolve_thinking_params
+
+    extra, effort = _resolve_thinking_params(
+        _nvidia_settings(model), thinking=True, reasoning_effort="low"
+    )
+    assert extra == {}
+    assert effort == "low"
+
+    extra_off, effort_off = _resolve_thinking_params(
+        _nvidia_settings(model), thinking=False, reasoning_effort="low"
+    )
+    assert extra_off == {}
+    assert effort_off is None
+
+
+def test_nvidia_model_name_containing_deepseek_still_takes_the_nvidia_branch():
+    """NVIDIA 上 deepseek-v4.1-flash 的名字含 deepseek，不能被 DeepSeek 原生分支抢走。"""
+    from pa_agent.ai.deepseek_client import _resolve_thinking_params
+
+    settings = _nvidia_settings("deepseek-ai/deepseek-v4.1-flash")
+    extra, effort = _resolve_thinking_params(
+        settings, thinking=True, reasoning_effort="high"
+    )
+    # DeepSeek 原生分支会返回 thinking.adaptive + output_config，这里必须为空。
+    assert "thinking" not in extra
+    assert "output_config" not in extra
+    assert extra == {}
+    assert effort == "high"
+
+
+def test_nvidia_clamps_max_effort_to_high():
+    """上游没有 max，夹到 high（与 bigmodel / ark 一致）。"""
+    from pa_agent.ai.deepseek_client import _resolve_thinking_params
+
+    _, effort = _resolve_thinking_params(
+        _nvidia_settings(), thinking=True, reasoning_effort="max"
+    )
+    assert effort == "high"
+
+
+def test_nvidia_stage2_uses_prefix_chain():
+    """NVIDIA 没有 cached_tokens，但链式仍能省掉一次 30 万字符重发。"""
+    from pa_agent.ai.deepseek_client import supports_kv_prefix_chain
+
+    assert supports_kv_prefix_chain(_nvidia_settings()) is True
+
+
+def test_stream_chat_keeps_content_on_chunks_that_also_carry_reasoning():
+    """同一个 chunk 里既有 reasoning_content 又有 content 时，正文不能被丢掉。
+
+    实测 NVIDIA NIM 的 stepfun-ai/step-5-preview 就长这样：早期 chunk 只给
+    reasoning，之后某些 chunk 两个字段同时出现，最后才纯 content。旧实现用
+    ``elif delta.content``，会把那些混合 chunk 的正文整段丢掉，结果 JSON 从
+    中间开始（``"reasoning":"测试"}...``），解析必然失败。
+    """
+    from types import SimpleNamespace
+
+    settings = AIProviderSettings(
+        model="stepfun-ai/step-5-preview",
+        base_url=_NVIDIA_BASE,
+        api_key="nvapi-test",
+        thinking=True,
+        reasoning_effort="low",
+    )
+    client = DeepSeekClient(settings)
+
+    def _chunk(*, reasoning=None, content=None):
+        delta = SimpleNamespace(reasoning_content=reasoning, content=content)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(delta=delta, finish_reason=None)],
+            usage=None,
+            id="chunk",
+            model="stepfun-ai/step-5-preview",
+        )
+
+    chunks = [
+        _chunk(reasoning="思考中…"),                                  # 只有 reasoning
+        _chunk(reasoning="继续", content='{"decision":'),             # 混合：旧实现丢内容
+        _chunk(reasoning="再想", content='"order_type":"不下单"'),     # 混合：旧实现丢内容
+        _chunk(content="}"),                                         # 只有 content
+    ]
+
+    seen: list[str] = []
+
+    class _Completions:
+        def create(self, **kwargs):
+            return iter(chunks)
+
+    class _FakeOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = MagicMock(completions=_Completions())
+
+    with patch("pa_agent.ai.deepseek_client._OpenAI", _FakeOpenAI):
+        reply = client.stream_chat(
+            [{"role": "user", "content": "hi"}],
+            on_content_token=seen.append,
+        )
+
+    expected = '{"decision":' + '"order_type":"不下单"' + "}"
+    assert reply.content == expected, reply.content
+    # 混合 chunk 的正文必须既进 reply.content 也触发 on_content_token
+    assert '"decision":' in seen or any('"decision"' in s for s in seen)
+    assert "".join(seen) == reply.content
+
+
+def test_stream_chat_still_separates_pure_reasoning_chunks():
+    """纯 reasoning 的 chunk 不能被误当正文塞进 content。"""
+    from types import SimpleNamespace
+
+    settings = AIProviderSettings(
+        model="stepfun-ai/step-5-preview",
+        base_url=_NVIDIA_BASE,
+        api_key="nvapi-test",
+        thinking=True,
+    )
+    client = DeepSeekClient(settings)
+
+    chunks = [
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(reasoning_content="只有思考", content=None),
+                    finish_reason=None,
+                )
+            ],
+            usage=None,
+            id="c",
+            model="m",
+        )
+    ]
+
+    class _Completions:
+        def create(self, **kwargs):
+            return iter(chunks)
+
+    class _FakeOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = MagicMock(completions=_Completions())
+
+    with patch("pa_agent.ai.deepseek_client._OpenAI", _FakeOpenAI):
+        reply = client.stream_chat([{"role": "user", "content": "hi"}])
+
+    assert reply.reasoning_content == "只有思考"
+    assert reply.content == ""

@@ -1265,3 +1265,98 @@ def test_prompt_too_large_window_expires(monkeypatch) -> None:  # noqa: ANN001
     assert prompt_too_large_active() is True
     reset_fallback_state_for_tests()
     assert prompt_too_large_active() is False
+
+
+# ---------------------------------------------------------------------------
+# 开跑前的体积预判：免费候选上下文只有 8k~32k，本项目的两阶段提示词实测
+# 7~10 万 tokens，数学上装不进去。以前每次都先发请求、等 60~140 秒撞
+# finish_reason=length，再记 30 分钟冷却；现在应当在发请求前就判掉。
+# ---------------------------------------------------------------------------
+
+
+def test_estimate_tokens_grows_with_content() -> None:
+    from pa_agent.ai.sensenova_fallback import estimate_prompt_tokens
+
+    small = [{"role": "user", "content": "hi"}]
+    large = [{"role": "user", "content": "hi" * 5000}]
+    assert estimate_prompt_tokens(small) < estimate_prompt_tokens(large)
+    assert estimate_prompt_tokens([]) >= 0
+    assert estimate_prompt_tokens(None) >= 0
+
+
+def test_estimate_tokens_counts_cjk_heavier_than_ascii() -> None:
+    from pa_agent.ai.sensenova_fallback import estimate_prompt_tokens
+
+    cjk = estimate_prompt_tokens([{"role": "user", "content": "行情判断" * 200}])
+    ascii_ = estimate_prompt_tokens([{"role": "user", "content": "abcd" * 200}])
+    # 同样 800 字符，中文按 1 token/字、英文按 4 字符/token
+    assert cjk > ascii_ * 2
+
+
+def test_prompt_exceeds_free_window_for_real_sized_prompt() -> None:
+    from pa_agent.ai.sensenova_fallback import prompt_exceeds_free_window
+
+    # 实测 Stage1 = system 27668 + user 93734 chars
+    messages = [
+        {"role": "system", "content": "x" * 27668},
+        {"role": "user", "content": "y" * 93734},
+    ]
+    assert prompt_exceeds_free_window(messages) is True
+
+
+def test_prompt_fits_free_window_for_short_prompt() -> None:
+    from pa_agent.ai.sensenova_fallback import prompt_exceeds_free_window
+
+    assert prompt_exceeds_free_window([{"role": "user", "content": "hi"}]) is False
+
+
+def test_run_free_stage_fallback_skips_without_any_http_call() -> None:
+    """体积判掉必须是「零请求、毫秒级返回」，否则等于把白等换个位置。"""
+    sent: list[Any] = []
+
+    def _never(*a: Any, **k: Any) -> Any:
+        sent.append(1)
+        raise AssertionError("大 prompt 不该发出任何 HTTP 请求")
+
+    messages = [
+        {"role": "system", "content": "x" * 27668},
+        {"role": "user", "content": "y" * 93734},
+    ]
+    result = run_free_stage_fallback(
+        messages=messages,
+        validate=lambda _r: Ok(obj={}),
+        primary_api_key="sk-PRIMARY",
+        http_get=_never,
+        http_post=_never,
+        http_stream=_never,
+    )
+
+    assert isinstance(result, FreeStageFailure)
+    assert result.attempts == []
+    assert sent == []
+    assert "context window" in result.message
+    assert prompt_too_large_active() is True
+
+
+def test_orchestrator_free_lane_returns_none_before_requesting() -> None:
+    """方舟主通道的「先试免费池」路径必须在这里被挡掉，不能等到 45 秒后。"""
+    settings = _sensenova_settings()
+    orch = _orchestrator(settings)
+
+    with patch(
+        "pa_agent.ai.sensenova_fallback.run_free_stage_fallback"
+    ) as patched:
+        recovered = orch._try_sensenova_free_stage(  # type: ignore[attr-defined]
+            stage="stage1",
+            messages=[
+                {"role": "system", "content": "x" * 27668},
+                {"role": "user", "content": "y" * 93734},
+            ],
+            validate_reply=lambda _r: Ok(obj={}),
+            on_reasoning_token=None,
+            on_content_token=None,
+            cancel_token=CancelToken(),
+        )
+
+    assert recovered is None
+    patched.assert_not_called()

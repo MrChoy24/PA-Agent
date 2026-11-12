@@ -12,6 +12,8 @@ import copy
 import logging
 import logging.handlers
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import List
 
@@ -114,11 +116,93 @@ class DropSpareChannelDiagnosticsFilter(logging.Filter):
         return not any(marker in message for marker in _SPARE_DIAGNOSTIC_MARKERS)
 
 
+#: 账号级故障（欠费/余额不足/凭据失效）在控制台上的统一文案。
+#: 刻意不提渠道名与 Key，但要明确指出「要你去充值或换 Key」——
+#: 否则用户只能看到「正在进行分析，请稍等」，永远排不出原因。
+_ACCOUNT_PROBLEM_TEXT = (
+    "AI 服务账户余额不足或凭据失效，已切换备用通道；请登录对应平台充值或更换 API Key。"
+)
+
+#: 与 ``pa_agent.ai.ark_gateway.is_account_level_error`` 保持一致的兜底判定。
+#: 这里不 import 那个模块，避免 logging 在极早期被配置时引入重依赖。
+_ACCOUNT_PROBLEM_MARKERS = (
+    "余额不足",
+    "无可用资源包",
+    "请充值",
+    "accountoverdue",
+    "overdue balance",
+    "account has been suspended",
+    "no available resource package",
+    "insufficient balance",
+    "insufficient_quota",  # noqa: E501 - marker literal
+    "配额不足",  # noqa: E501 - marker literal
+    "令牌已过期或验证不正确",
+)
+
+
+def _looks_like_account_problem(message: str) -> bool:
+    lowered = (message or "").lower()
+    return any(marker.lower() in lowered for marker in _ACCOUNT_PROBLEM_MARKERS)
+
+
+#: 同一次故障常常被两条日志命中（限流层一条、客户端 stream error 一条），
+#: 映射成同一句中文后在控制台上就是重复两遍。窗口内只提示一次。
+_ACCOUNT_NOTICE_COOLDOWN_S = 30.0
+_acct_lock = threading.Lock()
+_acct_last: float = 0.0
+
+
+def _account_notice_allowed(now: float | None = None) -> bool:
+    """True 表示这条账号级提示还能打印；冷却窗口内重复的返回 False。"""
+    global _acct_last
+    cur = time.monotonic() if now is None else float(now)
+    with _acct_lock:
+        if _acct_last and cur - _acct_last < _ACCOUNT_NOTICE_COOLDOWN_S:
+            return False
+        _acct_last = cur
+        return True
+
+
+def reset_account_notice_state() -> None:
+    """测试用：清掉去重窗口。"""
+    global _acct_last
+    with _acct_lock:
+        _acct_last = 0.0
+
+
+class DropDuplicateAccountNoticeFilter(logging.Filter):
+    """Account-level faults are reported once per burst, not once per logger."""
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
+        try:
+            message = record.getMessage()
+        except Exception:  # noqa: BLE001
+            return True
+        if not _looks_like_account_problem(message):
+            return True
+        return _account_notice_allowed()
+
+
 class ConsoleFormatter(MaskingFormatter):
     """Neutral console progress; keep the original record for file diagnostics."""
 
     def format(self, record: logging.LogRecord) -> str:
         message = record.getMessage()
+        # 账号级故障（欠费 / 余额不足 / 凭据失效）必须让用户看见：
+        # 这是唯一能让他去充值或换 Key 的线索，压成「请稍等」等于让他永远查不出原因。
+        # 判定放在限流之前——智谱余额不足的 HTTP 状态码也是 429。
+        # 去重由 DropDuplicateAccountNoticeFilter 在 handler 层完成。
+        if _looks_like_account_problem(message):
+            public_record = copy.copy(record)
+            public_record.name = "pa_agent.analysis"
+            public_record.levelno = logging.WARNING
+            public_record.levelname = "WARNING"
+            public_record.msg = _ACCOUNT_PROBLEM_TEXT
+            public_record.args = ()
+            public_record.exc_info = None
+            public_record.exc_text = None
+            public_record.stack_info = None
+            return super().format(public_record)
         is_backup = (
             record.name == "pa_agent.ai.sensenova_fallback"
             or "SenseNova free fallback" in message
@@ -278,6 +362,8 @@ def configure_logging(api_key: str = "") -> None:
     console_handler.addFilter(DropRateLimitExhaustedFilter())
     # Nor any spare-channel internals (model name, token counts, latency).
     console_handler.addFilter(DropSpareChannelDiagnosticsFilter())
+    # 同一次欠费会从两个 logger 各打一条；把它们合并成控制台上的一句。
+    console_handler.addFilter(DropDuplicateAccountNoticeFilter())
 
     handlers: list[logging.Handler] = [file_handler, console_handler]
 

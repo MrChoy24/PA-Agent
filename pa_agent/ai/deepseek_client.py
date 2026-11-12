@@ -161,9 +161,12 @@ def supports_kv_prefix_chain(settings: AIProviderSettings | None) -> bool:
     if _is_openclaw_agent_model(settings.model):
         return False
     # B.AI 代理真实 DeepSeek 模型，同样支持 KV prefix cache（两级推理链）。
+    # NVIDIA NIM 没有 cached_tokens（实测恒 0），但链式仍值得：
+    # stage2 直接复用 stage1 已发的 K 线表，省掉一次 30 万字符的重发。
     return (
         _is_deepseek_native(settings.base_url)
         or _is_bai(settings.base_url)
+        or _is_nvidia(settings.base_url)
         or _is_deepseek_model(settings.model)
     )
 
@@ -263,6 +266,48 @@ def _is_ark(base_url: str) -> bool:
     return "volces.com" in url or "volcengine" in url
 
 
+def _is_bigmodel(base_url: str) -> bool:
+    """智谱 BigModel (open.bigmodel.cn) OpenAI-compatible gateway.
+
+    2026-11 实测：
+      - ``max_tokens`` 只接受 [1, 131072]，项目默认 384000 会直接 400
+        （``1210 max_tokens参数非法：限制数值范围[1,131072]``）；
+      - ``thinking.type`` 认 ``enabled`` / ``disabled``；关闭思考后 glm-5
+        从 2.4s 降到 0.9s，因此按 thought 开关显式下发；
+      - 不排斥 ``temperature``（与方舟不同）。
+    注意：检测 base_url 优先于 _is_deepseek_model —— 格式随网关而非模型。
+    """
+    return "bigmodel.cn" in (base_url or "").lower()
+
+
+def _is_scnet(base_url: str) -> bool:
+    """超算互联网 (api.scnet.cn) OpenAI-compatible gateway.
+
+    2026-11 实测：
+      - ``max_tokens`` 到 384000 都不报错，无需限流；
+      - GLM 系模型（GLM-5.3-Flash）不带 ``thinking`` 会返回空正文
+        （``finish_reason=length`` 且 content 为空），必须显式下发
+        ``thinking.type``；DeepSeek 系模型带不带都正常。
+    """
+    return "scnet.cn" in (base_url or "").lower()
+
+
+def _is_nvidia(base_url: str) -> bool:
+    """NVIDIA NIM (integrate.api.nvidia.com) OpenAI-compatible gateway.
+
+    2026-11 实测（stepfun-ai/step-5-preview / mistral-large-4-1t-a52b /
+    z-ai/glm-5.3-flash / deepseek-ai/deepseek-v4.1-flash）：
+      - 不认 ``thinking``（传 ``{"type":"adaptive"}`` 直接 400），也不认
+        ``extra_body``；模型名里带 ``deepseek`` 时项目会走 DeepSeek 原生
+        分支发 thinking，因此这里必须提前拦下；
+      - 接受 ``temperature`` / ``reasoning_effort`` / ``top_p``；
+      - ``max_tokens`` 到 65536 正常，384000 会挂到超时；
+      - stream 走标准 SSE，``stream_options.include_usage`` 也支持。
+    ``cached_tokens`` 恒为 0，没有可用的隐式前缀缓存，所以 stage2 不做链式。
+    """
+    return "nvidia.com" in (base_url or "").lower()
+
+
 # Packy claude-officially returns 400 if max_tokens exceeds model output cap.
 _PACKY_CLAUDE_MAX_OUTPUT_TOKENS = 128_000
 # DeepSeek API: max_tokens must be in [1, 393216].
@@ -279,6 +324,12 @@ _BAI_MAX_OUTPUT_TOKENS = 8_192
 # 火山方舟 Ark：模型级上限不同（豆包 Seed-2.1 为 262144），统一取较安全的 32768。
 # 实测两阶段最长输出约 14k tokens，32768 足够且不会触发 400。
 _ARK_MAX_OUTPUT_TOKENS = 32_768
+# 智谱 BigModel (open.bigmodel.cn)：max_tokens 只接受 [1, 131072]，
+# 默认 384000 会直接 400（code 1210）。实测 glm-5 在 131072 下正常。
+_BIGMODEL_MAX_OUTPUT_TOKENS = 131_072
+# NVIDIA NIM (integrate.api.nvidia.com)：max_tokens 实测到 65536 仍 200，
+# 但 384000 会让请求挂到客户端超时（120s 无响应），因此按中等值限流。
+_NVIDIA_MAX_OUTPUT_TOKENS = 65_536
 
 
 def _model_uses_claude_adaptive(model: str) -> bool:
@@ -394,6 +445,12 @@ def _provider_max_output_tokens(settings: AIProviderSettings) -> int:
     elif _is_ark(settings.base_url):
         # 火山方舟：默认 384000 超过模型上限（如豆包 262144），会直接 400。
         cap = _ARK_MAX_OUTPUT_TOKENS
+    elif _is_bigmodel(settings.base_url):
+        # 智谱 BigModel：上限 131072，超出直接 400（code 1210）。
+        cap = _BIGMODEL_MAX_OUTPUT_TOKENS
+    elif _is_nvidia(settings.base_url):
+        # NVIDIA NIM：384000 会挂到客户端超时，65536 实测正常。
+        cap = _NVIDIA_MAX_OUTPUT_TOKENS
     elif _is_mimo(settings):
         cap = mimo_max_output_tokens(settings.model)
     else:
@@ -468,6 +525,31 @@ def _resolve_thinking_params(
 
             return {"thinking": {"type": "enabled"}}, ARK_THINKING_EFFORT
         return {"thinking": {"type": "disabled"}}, None
+
+    if _is_bigmodel(settings.base_url) or _is_scnet(settings.base_url):
+        # 智谱 BigModel / 超算互联网：两者都认 thinking.type = enabled / disabled。
+        # - BigModel 不开 thinking 更快（glm-5 实测 0.9s vs 2.4s），但仍按设置走；
+        # - 超算的 GLM 系模型**必须**开 thinking，否则返回空正文
+        #   （finish_reason=length 且 content 为空），因此强制开启。
+        # 强度用 reasoning_effort；上游没有 max，夹到 high。
+        force_on = _is_scnet(settings.base_url) and "glm" in model.lower()
+        if _thinking or force_on:
+            _effort_text = _adaptive_output_effort(_effort)
+            if _effort_text == "max":
+                _effort_text = "high"
+            return {"thinking": {"type": "enabled"}}, _effort_text
+        return {"thinking": {"type": "disabled"}}, None
+
+    if _is_nvidia(settings.base_url):
+        # NVIDIA NIM 不认 thinking 字段（传了直接 400 Bad Request）。
+        # 它只接受 reasoning_effort，且该网关下模型名常含 deepseek，
+        # 必须在这里拦下，否则会落到下面的 DeepSeek 原生分支。
+        if _thinking:
+            _effort_text = _adaptive_output_effort(_effort)
+            if _effort_text == "max":
+                _effort_text = "high"
+            return {}, _effort_text
+        return {}, None
 
     if _is_deepseek_native(settings.base_url) or _is_deepseek_model(model):
         # DeepSeek v4+ requires thinking.type=adaptive + output_config.effort;
@@ -559,6 +641,27 @@ class DeepSeekClient:
     def __init__(self, settings: AIProviderSettings, logger_: logging.Logger | None = None) -> None:
         self._settings = settings
         self._log = logger_ or logger
+        # openai.OpenAI 内部持有一个 httpx.Client（连接池 + TLS 会话）。每次请求
+        # 都新建的话，TLS 握手与 DNS 解析都要重来一遍，而本项目一轮分析会连发
+        # 好几次（stage1 / stage2 / 重试 / 降级）。按 (base_url, api_key) 复用。
+        self._clients: dict[tuple[str, str, int], Any] = {}
+
+    def _client_for(self, openai_cls: Any, kwargs: dict[str, Any]) -> Any:
+        """Return a cached ``OpenAI`` client for these connection parameters."""
+        key = (
+            str(kwargs.get("base_url") or ""),
+            str(kwargs.get("api_key") or ""),
+            int(kwargs.get("max_retries", 2) or 0),
+        )
+        cached = self._clients.get(key)
+        if cached is not None:
+            return cached
+        client = openai_cls(**kwargs)
+        # 候选链最多十几条，缓存上限留一点余量，避免长期运行堆积连接池。
+        if len(self._clients) >= 24:
+            self._clients.clear()
+        self._clients[key] = client
+        return client
 
     def update_provider(self, settings: AIProviderSettings) -> None:
         """Replace in-memory provider settings (e.g. after QClaw auto-fallback)."""
@@ -607,6 +710,10 @@ class DeepSeekClient:
             masked_key[-4:] if len(masked_key) >= 4 else "****",
             len(api_messages),
         )
+        from pa_agent.ai.model_trace import mark as _trace_mark, record as _trace_record
+
+        _trace_model = _effective_api_model(self._settings)
+        _trace_record(_trace_model, self._settings.base_url)
 
         openai_cls = _load_openai()
 
@@ -619,7 +726,7 @@ class DeepSeekClient:
         _sensenova_fast_fail = is_sensenova_fallback_eligible(self._settings.base_url)
         if _sensenova_fast_fail:
             _openai_kwargs["max_retries"] = 0
-        client = openai_cls(**_openai_kwargs)
+        client = self._client_for(openai_cls, _openai_kwargs)
 
         t0 = time.monotonic()
         create_kwargs: dict[str, Any] = {
@@ -657,9 +764,11 @@ class DeepSeekClient:
         except Exception as exc:
             latency_ms = (time.monotonic() - t0) * 1000
             self._log.error("DeepSeekClient API error after %.0f ms: %s", latency_ms, exc)
+            _trace_mark(_trace_model, ok=False)
             raise
 
         latency_ms = (time.monotonic() - t0) * 1000
+        _trace_mark(_trace_model, ok=True)
 
         msg = response.choices[0].message
         content = msg.content or ""
@@ -803,6 +912,12 @@ class DeepSeekClient:
             bool(system_param),
             len(api_messages),
         )
+        # 工具栏「实际模型」徽标的数据源：这里才是真正发出去的模型名
+        # （方舟会先把别名翻译成真实 ID），失败时置 False 让界面显示降级过程。
+        from pa_agent.ai.model_trace import mark as _trace_mark, record as _trace_record
+
+        _trace_model = _effective_api_model(self._settings)
+        _trace_record(_trace_model, self._settings.base_url)
 
         openai_cls = _load_openai()
 
@@ -813,7 +928,7 @@ class DeepSeekClient:
         _sensenova_fast_fail = is_sensenova_fallback_eligible(self._settings.base_url)
         if _sensenova_fast_fail:
             _openai_kwargs["max_retries"] = 0
-        client = openai_cls(**_openai_kwargs)
+        client = self._client_for(openai_cls, _openai_kwargs)
 
         t0 = time.monotonic()
         reasoning_content = ""
@@ -911,19 +1026,25 @@ class DeepSeekClient:
                     reasoning_content += r
                     if on_reasoning_token is not None:
                         on_reasoning_token(r)
-                elif delta.content:
-                    content += delta.content
+                # 不要用 elif：部分网关（实测 NVIDIA NIM 的 step-5-preview）
+                # 会在同一个 chunk 里同时给出 reasoning_content 和 content，
+                # 用 elif 会把这一段正文整段丢掉，导致 JSON 从中间开始。
+                _delta_content = getattr(delta, "content", None)
+                if _delta_content:
+                    content += _delta_content
                     if on_content_token is not None:
-                        on_content_token(delta.content)
+                        on_content_token(_delta_content)
 
         except CancelledError:
             raise
         except Exception as exc:
             latency_ms = (time.monotonic() - t0) * 1000
             self._log.error("DeepSeekClient stream error after %.0f ms: %s", latency_ms, exc)
+            _trace_mark(_trace_model, ok=False)
             raise
 
         latency_ms = (time.monotonic() - t0) * 1000
+        _trace_mark(_trace_model, ok=True)
 
         usage = AIUsage(
             prompt_tokens=prompt_tokens,

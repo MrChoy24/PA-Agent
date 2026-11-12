@@ -51,6 +51,24 @@ def is_rate_limit_error(exc: BaseException) -> bool:
     return False
 
 
+def _is_account_level(exc: BaseException) -> bool:
+    """True for欠费/余额不足/凭据失效 —— 重试多少次都不会好转。
+
+    智谱 bigmodel 余额不足时返回 HTTP **429**，响应体才是真相
+    ``{"error":{"code":"1113","message":"余额不足或无可用资源包,请充值。"}}``。
+    只按 429 处理会让每个阶段白等 5/10/20/40/80 秒（≈155 秒）再切备用，
+    用户看到的现象就是「一直显示正在分析、永不结束」。
+    """
+    try:
+        from pa_agent.ai.ark_gateway import is_account_level_error
+    except Exception:  # noqa: BLE001 - never let detection break retries
+        return False
+    try:
+        return bool(is_account_level_error(exc))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def call_with_rate_limit_backoff(
     fn: Callable[[], T],
     *,
@@ -65,6 +83,9 @@ def call_with_rate_limit_backoff(
 
     Non-rate-limit exceptions propagate immediately. After *max_retries* exhausted
     the last rate-limit error is re-raised.
+
+    账号级故障（欠费 / 余额不足 / 凭据失效）即使伪装成 429 也**立即上抛**：
+    退避等待换不来额度，只会把一轮分析拖成几分钟。
     """
     log_ = log or logger
     attempt = 0
@@ -73,6 +94,15 @@ def call_with_rate_limit_backoff(
             return fn()
         except Exception as exc:  # noqa: BLE001
             if not is_rate_limit_error(exc):
+                raise
+            if _is_account_level(exc):
+                # 措辞刻意避开「限流」字样：控制台的限流过滤会把它整条吞掉，
+                # 而这一条正是用户唯一能据此去充值/换 Key 的线索。
+                log_.error(
+                    "%s 账户额度或凭据不可用，本轮不再重试，直接切换备用链路: %s",
+                    stage_label or "API",
+                    exc,
+                )
                 raise
             if cancel_token is not None and cancel_token.is_set():
                 raise

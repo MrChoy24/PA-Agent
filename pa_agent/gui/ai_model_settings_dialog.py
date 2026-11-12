@@ -13,7 +13,6 @@ from PyQt6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
-    QLabel,
     QLineEdit,
     QMessageBox,
     QPushButton,
@@ -87,13 +86,8 @@ class AIModelSettingsDialog(QDialog):
         api_key_row.addWidget(self._show_key_btn)
         form.addRow("API Key:", api_key_row)
 
-        # 备用链路 Key：由主通道类型决定是否显示。
-        self._glm_key_label = QLabel("GLM 备用 Key:")
-        self._glm_key_edit = QLineEdit()
-        self._glm_key_edit.setPlaceholderText("输入 GLM Key")
-        self._glm_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        form.addRow(self._glm_key_label, self._glm_key_edit)
-        self._base_url_edit.textChanged.connect(self._refresh_glm_key_row)
+        # GLM 备用的模型 / Base URL / API Key 三件套统一下方「备用 AI 提供商」
+        # 面板的第 0 行（内置行），这里不再单独放一行 Key。
 
         self._thinking_check = QCheckBox("启用 Thinking")
         form.addRow("Thinking:", self._thinking_check)
@@ -133,13 +127,17 @@ class AIModelSettingsDialog(QDialog):
         self._model_edit.setText(p.model)
         self._base_url_edit.setText(p.base_url)
         self._api_key_edit.setText(p.api_key)
-        self._glm_key_edit.setText(str(getattr(p, "backup_glm_api_key", "") or ""))
-        self._refresh_glm_key_row()
         self._thinking_check.setChecked(p.thinking)
         idx = self._reasoning_effort_combo.findText(p.reasoning_effort)
         if idx >= 0:
             self._reasoning_effort_combo.setCurrentIndex(idx)
         self._backup_panel.load_entries(list(getattr(self._settings, "ai_backups", None) or []))
+        self._backup_panel.load_glm_entry(
+            model=str(getattr(p, "backup_glm_model", "") or ""),
+            base_url=str(getattr(p, "backup_glm_base_url", "") or ""),
+            api_key=str(getattr(p, "backup_glm_api_key", "") or ""),
+            enabled=bool(getattr(p, "backup_glm_enabled", True)),
+        )
 
     def _on_save(self) -> None:
         p = self._settings.provider
@@ -184,33 +182,34 @@ class AIModelSettingsDialog(QDialog):
         p.thinking = self._thinking_check.isChecked()
         p.reasoning_effort = self._reasoning_effort_combo.currentText()  # type: ignore[assignment]
 
-        self._apply_glm_backup_key(p)
+        self._apply_glm_backup(p)
         self._settings.ai_backups = self._backup_panel.collect_entries()
 
         save_settings(self._settings, SETTINGS_JSON_PATH)
         self.accept()
 
-    def _refresh_glm_key_row(self) -> None:
-        """GLM 备用 Key 在主通道为 SenseNova 或火山方舟网关时可用。"""
-        from pa_agent.ai.glm_backup import is_glm_backup_eligible
+    def _apply_glm_backup(self, p: Any) -> None:
+        """写回 GLM 备用三件套，并同步维护 fallbacks 里的那条 GLM 条目。
 
-        visible = is_glm_backup_eligible(self._base_url_edit.text().strip())
-        self._glm_key_label.setVisible(visible)
-        self._glm_key_edit.setVisible(visible)
+        - 勾选且有 Key：挂载 / 就地刷新（model、base_url、api_key 全跟着走）。
+        - 未勾选或 Key 为空：当次就从链里剔除，不等下一次分析。
+        """
+        from pa_agent.ai.glm_backup import drop_glm_fallback, ensure_glm_fallback
 
-    def _apply_glm_backup_key(self, p: Any) -> None:
-        """保存 GLM Key，并同步维护 fallbacks 里的 glm-4-flash 条目。"""
-        from pa_agent.ai.glm_backup import GLM_BASE_URL, GLM_MODEL, ensure_glm_fallback
-
-        p.backup_glm_api_key = self._glm_key_edit.text().strip()
-        if p.backup_glm_api_key:
-            ensure_glm_fallback(p)
+        # 改配置之前的旧身份：链里那条老条目可能还是用旧值写成的。
+        old_identity = (
+            str(getattr(p, "backup_glm_model", "") or "").strip(),
+            str(getattr(p, "backup_glm_base_url", "") or "").strip(),
+        )
+        model, base_url, api_key, enabled = self._backup_panel.collect_glm_entry()
+        p.backup_glm_model = model
+        p.backup_glm_base_url = base_url
+        p.backup_glm_api_key = api_key
+        p.backup_glm_enabled = enabled
+        if enabled and api_key:
+            ensure_glm_fallback(p, extra_identities=[old_identity])
             return
-        p.fallbacks = [
-            fb for fb in (getattr(p, "fallbacks", None) or [])
-            if not (str(getattr(fb, "model", "")) == GLM_MODEL
-                    and str(getattr(fb, "base_url", "")) == GLM_BASE_URL)
-        ]
+        drop_glm_fallback(p, extra_identities=[old_identity])
 
     # ── 辅助 ──────────────────────────────────────────────────────────────────
 

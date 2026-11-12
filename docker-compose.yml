@@ -32,18 +32,23 @@ services:
     pull_policy: build
     container_name: pa-agent
     restart: unless-stopped
+    # Linux 上 host.docker.internal 默认不存在，加这条才有 DNS 记录。
+    # 用途：宿主机上跑着 ShellCrash / Clash（监听 127.0.0.1:7890 或 0.0.0.0:7890）时，
+    # .env 里可以写 HTTPS_PROXY=http://host.docker.internal:7890，
+    # 这样容器内的请求会经宿主机上的代理出网。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     env_file:
       - .env
     environment:
       # 容器内时区：K线时间戳按 UTC 对齐，但日志与记录文件名用本地时间
       TZ: Asia/Shanghai
-      # 轮询间隔（秒）。交易所限频：Binance 现货 1200 权重/分钟，
-      # 20 秒一次 klines(权重 2) 完全安全。
-      PA_DAEMON_POLL_INTERVAL: "20"
-      # 两次分析之间的最小间隔（秒），防止 K 线抖动导致连续烧 token
-      PA_DAEMON_ANALYSIS_COOLDOWN: "120"
-      # 只在 K 线收盘后才分析（推荐 true）
-      PA_DAEMON_WAIT_BAR_CLOSE: "true"
+      # 注意：轮询间隔 / 分析冷却 / 等K线收盘 这三项原本硬写在这里，
+      # 而 compose 的 environment 优先级高于 env_file，导致用户改 .env
+      # 永远不生效。现在一律只认 .env，本文件不再重复定义：
+      #   PA_DAEMON_POLL_INTERVAL       轮询间隔（秒），默认 20
+      #   PA_DAEMON_ANALYSIS_COOLDOWN   两次分析最小间隔（秒），默认 120
+      #   PA_DAEMON_WAIT_BAR_CLOSE      只在K线收盘后分析，默认 true
     volumes:
       - ./config:/app/config            # settings.json（含 Key，注意权限）
       - ./logs:/app/logs                # pa_agent.log

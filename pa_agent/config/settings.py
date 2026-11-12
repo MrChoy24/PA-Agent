@@ -34,6 +34,13 @@ class AIProviderSettings(BaseModel):
     #: 备用链路的 api key（可选）。
     #: 由 glm_backup.ensure_glm_fallback() 自动挂到 fallbacks 链上。
     backup_glm_api_key: str = ""
+    #: GLM 备用通道的模型名 / Base URL（空则回落到 glm_backup 的常量）。
+    #: 与 api_key 一起构成「备用 AI 提供商」表格里固定的 GLM 行。
+    backup_glm_model: str = "glm-4-flash"
+    backup_glm_base_url: str = "https://open.bigmodel.cn/api/paas/v4"
+    #: 是否把 GLM 备用挂进 fallback 链（面板上那一行的勾选状态）。
+    #: 与 is_glm_backup_eligible(base_url) 是 AND 关系；老配置缺该键时默认 True。
+    backup_glm_enabled: bool = True
     #: 显示名（只有「备用 AI 提供商」列表里的条目会用到）。
     name: str = ""
     #: 是否参与尝试（只有「备用 AI 提供商」列表里的条目会用到）。
@@ -269,6 +276,45 @@ def _drop_legacy_feishu_section(raw: dict) -> bool:
     return True
 
 
+def _drop_stale_ark_fallbacks(raw: dict) -> bool:
+    """主通道已经不是方舟时，删掉 fallbacks 里残留的方舟池。
+
+    背景：早期版本会在方舟网关下把 13 条方舟模型写进 ``provider.fallbacks``
+    并落盘。后来主通道换成别的网关，这 13 条仍在文件里，于是每次分析都要
+    从一条整体欠费的池子里逐条撞 403（m13007 修的是「不再白等」，这里是
+    「干脆别放进去」）。只删方舟网关的条目，用户自己的备用接口一条不碰。
+    """
+    provider = raw.get("provider")
+    if not isinstance(provider, dict):
+        return False
+    primary = str(provider.get("base_url") or "").strip().lower()
+    if "volces.com" in primary or "volcengine" in primary or "ark.cn-beijing" in primary:
+        # 主通道就是方舟：池子是有意义的，保留。
+        return False
+    fallbacks = provider.get("fallbacks")
+    if not isinstance(fallbacks, list) or not fallbacks:
+        return False
+    kept = []
+    dropped = 0
+    for item in fallbacks:
+        if not isinstance(item, dict):
+            kept.append(item)
+            continue
+        url = str(item.get("base_url") or "").strip().lower()
+        if "volces.com" in url or "volcengine" in url or "ark.cn-beijing" in url:
+            dropped += 1
+            continue
+        kept.append(item)
+    if not dropped:
+        return False
+    provider["fallbacks"] = kept
+    logger.info(
+        "已从 settings.json 的 fallbacks 移除 %d 条失效的方舟模型（主通道已不是方舟网关）",
+        dropped,
+    )
+    return True
+
+
 def load_settings(path: Path | None = None) -> "Settings":
     """Load settings from *path* (default: SETTINGS_JSON_PATH).
 
@@ -308,8 +354,9 @@ def load_settings(path: Path | None = None) -> "Settings":
     raw.setdefault("provider", {}).setdefault("api_key", "")
 
     dropped_feishu = _drop_legacy_feishu_section(raw)
+    dropped_ark = _drop_stale_ark_fallbacks(raw)
     settings = Settings.model_validate(raw)
-    dirty = dropped_feishu
+    dirty = dropped_feishu or dropped_ark
     if settings.pushplus.enabled and not settings.pushplus.token.strip():
         if not (os.environ.get("PUSHPLUS_TOKEN") or "").strip():
             settings.pushplus.enabled = False

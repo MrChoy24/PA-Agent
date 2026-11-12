@@ -71,10 +71,24 @@ def test_is_ark_base(url: str | None, expected: bool) -> None:
         "Error code: 401 - The API key doesn't exist.",
         "AuthenticationError: invalid api key",
         "令牌已过期或验证不正确",
+        # 智谱 bigmodel 余额不足：HTTP 429 + code 1113，响应体才是真相。
+        "Error code: 429 - 余额不足或无可用资源包,请充值。",
+        '{"error":{"code":"1113","message":"余额不足或无可用资源包,请充值。"}}',
+        "no available resource package",
+        "insufficient balance",
     ],
 )
 def test_is_account_level_error_matches(text: str) -> None:
     assert ag.is_account_level_error(text) is True
+
+
+def test_glm_balance_429_is_not_treated_as_a_plain_rate_limit() -> None:
+    """智谱 1113 是余额不足，不是限流：按限流退避会白等约 155 秒。"""
+    from pa_agent.ai.rate_limit import is_rate_limit_error
+
+    exc = RuntimeError("Error code: 429 - 余额不足或无可用资源包,请充值。")
+    assert is_rate_limit_error(exc) is True  # 状态码层面确实是 429
+    assert ag.is_account_level_error(exc) is True  # 但语义上是账号级
 
 
 @pytest.mark.parametrize(
