@@ -1,5 +1,7 @@
 # PA Agent — AI K线分析辅助工具（桌面端）
 
+[![CI](https://github.com/MrChoy24/PA-Agent/actions/workflows/ci.yml/badge.svg)](https://github.com/MrChoy24/PA-Agent/actions/workflows/ci.yml)
+
 ---
 
 面向主观交易者的 **价格行为（Price Action）** AI 辅助决策工具。从 **Binance / OKX**（REST 公开接口，无需 MT5 终端）读取 K 线，将结构化 K 线数据与预计算特征送入大模型做**两阶段分析**（市场诊断 → 交易决策）。默认**只分析、不下单**；如需真正执行，可在设置里显式开启「自动交易」，默认仍为试运行（只记录意图，不发单）。
@@ -19,7 +21,7 @@
 - 📚 **经验库**：按周期位置检索历史案例供分析参考
 - 📝 **完整落盘**：Prompt、原始响应、诊断/决策 JSON、Token 用量、追问记录
 - 🛡️ **可配置校验体系**：JSON 校验、一致性检查、语义校验、截断修复、失败自动重试
-- 🔒 **API Key** 本地加密存储
+- 🔒 **凭据只留在本机**：API Key 保存在 `config/settings.json`，该文件已被 `.gitignore` 排除，任何分发包与仓库都不包含它
 
 ---
 
