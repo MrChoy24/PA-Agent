@@ -352,6 +352,45 @@ def test_auto_trade_env_rejects_out_of_range_values(
     assert applied == []
 
 
+def test_auto_trade_env_overrides_protection_orders(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """开仓后挂保护单的开关与 TP1 比例也能从 .env 下来。"""
+    from pa_agent.daemon.config import apply_auto_trade_env_overrides
+
+    settings = Settings()
+    settings.auto_trade.protect_after_entry = True
+    settings.auto_trade.tp1_fraction = 0.5
+    monkeypatch.setenv("PA_DAEMON_PROTECT_AFTER_ENTRY", "false")
+    monkeypatch.setenv("PA_DAEMON_TP1_FRACTION", "0.3")
+
+    applied = apply_auto_trade_env_overrides(settings)
+
+    assert settings.auto_trade.protect_after_entry is False
+    assert settings.auto_trade.tp1_fraction == pytest.approx(0.3)
+    assert set(applied) == {
+        "PA_DAEMON_PROTECT_AFTER_ENTRY",
+        "PA_DAEMON_TP1_FRACTION",
+    }
+
+
+def test_auto_trade_env_rejects_bad_tp1_fraction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TP1 比例必须是 (0, 1) 的真分数，否则止盈会变成 0 张或超过整仓。"""
+    from pa_agent.daemon.config import apply_auto_trade_env_overrides
+
+    for bad in ("0", "1", "1.5", "-0.3", "abc"):
+        settings = Settings()
+        settings.auto_trade.tp1_fraction = 0.5
+        monkeypatch.setenv("PA_DAEMON_TP1_FRACTION", bad)
+
+        applied = apply_auto_trade_env_overrides(settings)
+
+        assert settings.auto_trade.tp1_fraction == pytest.approx(0.5), bad
+        assert "PA_DAEMON_TP1_FRACTION" not in applied, bad
+
+
 def test_auto_trade_env_cannot_loosen_safety_ceilings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

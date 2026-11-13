@@ -20,7 +20,7 @@
 
 ## `settings.json` 字段说明
 
-配置分为多个顶层组：`provider`、`general`、`prompt`、`validation`、`pushplus`、`dingtalk`、`binance`、`okx`、`auto_trade`、`tushare`。
+配置分为多个顶层组：`provider`、`general`、`prompt`、`validation`、`pushplus`、`dingtalk`、`binance`、`okx`、`auto_trade`、`ai_backups`。
 
 ### provider — AI 提供商
 
@@ -63,7 +63,7 @@
 
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `general.last_data_source` | string | `"binance"` | K 线数据来源：`binance` / `okx`（GUI 下拉选项）；`ashare` / `akshare` / `tushare` / `eastmoney_futures` 仅代码支持。历史值 `mt5` / `tradingview` 会自动迁移为 `binance` |
+| `general.last_data_source` | string | `"binance"` | K 线数据来源：`binance` / `okx`。历史值（`mt5` / `tradingview` / `ashare` / `akshare` / `tushare` / `yfinance` / `eastmoney_futures` 等）会自动迁移为 `binance` |
 | `general.last_symbol` | string | `"BTCUSDT"` | 默认品种，中性写法（如 `BTCUSDT`、`ETHUSDT`），OKX 也接受 `BTC-USDT` |
 | `general.last_timeframe` | string | `"15m"` | 默认周期，如 `1m`、`5m`、`15m`、`1h`、`4h`、`1d` |
 | `general.analysis_bar_count` | int | `100` | 提交分析时使用的 K 线数量（2–5000） |
@@ -103,6 +103,7 @@
 | `dingtalk.at_mobiles` | list[str] | `[]` | 需要 @ 的手机号列表 |
 | `dingtalk.at_all` | bool | `false` | 是否 @ 所有人 |
 | `dingtalk.notify_on_order_only` | bool | `true` | 仅在出下单信号时推送 |
+| `dingtalk.notify_on_trade_filled` | bool | `true` | 实盘成交（`dry_run=false` 且交易所已受理）后推送成交明细：成交均价、数量、名义金额与保证金、下单时间、委托号、止损/TP1/TP2 挂单结果。**试运行永远不会推送** |
 | `dingtalk.msg_type` | string | `"markdown"` | 消息类型：`markdown` / `text` |
 
 ### auto_trade — 自动交易

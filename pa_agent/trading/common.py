@@ -27,6 +27,10 @@ MARKET_FUTURES = "futures"
 # 对外统一的订单类型（内部各自翻译成交易所口径）
 ORDER_TYPE_MARKET = "MARKET"
 ORDER_TYPE_LIMIT = "LIMIT"
+# 计划委托：价格先触到触发价，再按市价送进撮合（仅 OKX 合约）。
+# 用途是「突破单」——分析本身要跑几分钟，直接市价追进去滑点不可控，
+# 挂限价又可能在突破瞬间不成交，所以先挂触发价等它被穿。
+ORDER_TYPE_TRIGGER = "TRIGGER"
 
 # 保证金模式（Binance 内部叫 CROSSED / ISOLATED）
 MARGIN_ISOLATED = "isolated"
@@ -74,6 +78,9 @@ _ORDER_LIMIT_WORDS: frozenset[str] = frozenset(
 _ORDER_MARKET_WORDS: frozenset[str] = frozenset(
     {"market", "市价", "市价单", "市价委托"}
 )
+_ORDER_TRIGGER_WORDS: frozenset[str] = frozenset(
+    {"trigger", "计划委托", "触发单", "条件触发"}
+)
 
 _MARGIN_CROSS_WORDS: frozenset[str] = frozenset({"cross", "crossed", "全仓", "cross margin"})
 _MARGIN_ISOLATED_WORDS: frozenset[str] = frozenset(
@@ -117,9 +124,124 @@ class TradeResult:
     notional_usdt: float = 0.0
     position_side: str = POSITION_LONG
     margin_mode: str = MARGIN_ISOLATED
+    # ── 开仓成功后立刻挂上的保护单（止损 / TP1 / TP2） ──
+    #: 每条腿的结果快照；空元组表示「没有挂」或「本次没配置保护单」。
+    protections: tuple["ProtectionOrder", ...] = ()
+
+
+# 保护单的腿：止损 / 止盈一 / 止盈二
+PROTECT_STOP_LOSS = "stop_loss"
+PROTECT_TAKE_PROFIT_1 = "take_profit_1"
+PROTECT_TAKE_PROFIT_2 = "take_profit_2"
+
+_PROTECT_LABELS: dict[str, str] = {
+    PROTECT_STOP_LOSS: "止损",
+    PROTECT_TAKE_PROFIT_1: "TP1",
+    PROTECT_TAKE_PROFIT_2: "TP2",
+}
+
+
+def protection_label(kind: str) -> str:
+    """保护单腿的中文标签（止损 / TP1 / TP2）；未知类型原样返回。"""
+    return _PROTECT_LABELS.get(kind, kind or "保护单")
+
+
+@dataclass(frozen=True)
+class ProtectionOrder:
+    """一条保护单（止损或某个止盈）的下单结果。
+
+    保护单是「开仓成交后立刻挂到交易所」的条件单，目的是一旦本程序崩了/
+    服务器断连，交易所侧仍然会在触发价执行止盈止损，而不依赖本程序还活着。
+
+    ``kind`` 取 :data:`PROTECT_STOP_LOSS` / :data:`PROTECT_TAKE_PROFIT_1` /
+    :data:`PROTECT_TAKE_PROFIT_2`；``ok=False`` 时 ``message`` 是可直接展示
+    给人看的中文原因（例如「现货无原生保护单」「触发价方向不对」）。
+    """
+
+    kind: str
+    ok: bool = False
+    trigger_price: float = 0.0
+    qty: float = 0.0
+    order_id: str = ""
+    message: str = ""
+    raw: dict = field(default_factory=dict)
+
+    @property
+    def label(self) -> str:
+        """中文标签：止损 / TP1 / TP2。"""
+        return protection_label(self.kind)
+
+    def describe(self) -> str:
+        """一行可读文本，直接进日志/JSONL。"""
+        head = f"{self.label}@{format_decimal(self.trigger_price)}"
+        if self.ok:
+            oid = self.order_id or "—"
+            return f"{head} 已挂（{oid}）"
+        return f"{head} 未挂：{self.message or '未知原因'}"
 
 
 # ── 参数归一化（永不抛异常） ──────────────────────────────────────────────────
+
+
+def plan_protections(
+    *,
+    position_side: Any,
+    entry_price: Any,
+    stop_loss: Any,
+    take_profit_1: Any,
+    take_profit_2: Any,
+    total_qty: Any,
+    tp1_fraction: float = 0.5,
+) -> list[tuple[str, float, float, str]]:
+    """把决策里的止损/止盈价整理成待挂的保护单计划。
+
+    返回 ``[(kind, trigger_price, qty, problem)]``：``problem`` 为空表示这条腿
+    可以挂；非空是**中文原因**，调用方应把它写进日志而不是当作异常。
+
+    校验规则（与决策侧 ``trade_metrics`` 的几何要求一致）：
+
+    * 做多：``stop < entry < tp1 <= tp2``
+    * 做空：``tp2 <= tp1 < entry < stop``
+
+    价格缺失、非正数、方向反了都会被跳过（``problem`` 说明原因），
+    **不会**因为某条腿不合法就整体放弃 —— 止损能挂就先挂止损。
+
+    ``qty`` 按 ``tp1_fraction`` 拆分：TP1 拿 ``total_qty * tp1_fraction``，
+    TP2 拿剩下的；止损永远用全量 ``total_qty``（先把保命那条挂稳）。
+    """
+    side = normalize_position_side(position_side)
+    is_long = side == POSITION_LONG
+    entry = to_float(entry_price, 0.0)
+    qty_total = to_float(total_qty, 0.0)
+
+    planned: list[tuple[str, float, float, str]] = []
+
+    def _leg(kind: str, raw: Any, want_above: bool, leg_qty: float) -> None:
+        price = to_float(raw, 0.0)
+        if price <= 0:
+            planned.append((kind, 0.0, leg_qty, "决策没有给出有效价格"))
+            return
+        if entry > 0:
+            if want_above and price <= entry:
+                planned.append((kind, price, leg_qty, "触发价没有高过入场价"))
+                return
+            if not want_above and price >= entry:
+                planned.append((kind, price, leg_qty, "触发价没有低于入场价"))
+                return
+        planned.append((kind, price, leg_qty, ""))
+
+    # 止损永远全量：先保命
+    _leg(PROTECT_STOP_LOSS, stop_loss, not is_long, qty_total)
+
+    fraction = to_float(tp1_fraction, 0.5)
+    if fraction <= 0 or fraction >= 1:
+        fraction = 0.5
+    tp1_qty = qty_total * fraction if qty_total > 0 else 0.0
+    tp2_qty = (qty_total - tp1_qty) if qty_total > 0 else 0.0
+
+    _leg(PROTECT_TAKE_PROFIT_1, take_profit_1, is_long, tp1_qty)
+    _leg(PROTECT_TAKE_PROFIT_2, take_profit_2, is_long, tp2_qty)
+    return planned
 
 
 def _match_word(value: Any, table: dict[str, str], default: str) -> str:
@@ -153,13 +275,15 @@ def normalize_market_type(value: Any) -> str:
 
 
 def normalize_order_type(value: Any) -> str:
-    """把任意输入归一成 :data:`ORDER_TYPE_MARKET` / :data:`ORDER_TYPE_LIMIT`。
+    """把任意输入归一成 :data:`ORDER_TYPE_MARKET` / :data:`ORDER_TYPE_LIMIT`
+    / :data:`ORDER_TYPE_TRIGGER`。
 
     非法值回落到 ``MARKET``（``place_order`` 内部仍会做严格校验，
     避免把拼错类型当成市价单发出去）。
     """
     table = {word: ORDER_TYPE_LIMIT for word in _ORDER_LIMIT_WORDS}
     table.update({word: ORDER_TYPE_MARKET for word in _ORDER_MARKET_WORDS})
+    table.update({word: ORDER_TYPE_TRIGGER for word in _ORDER_TRIGGER_WORDS})
     return _match_word(value, table, ORDER_TYPE_MARKET)
 
 
@@ -213,6 +337,15 @@ def _to_decimal(value: Any) -> Decimal | None:
     except (InvalidOperation, ValueError, TypeError):
         return None
     return result if result.is_finite() else None
+
+
+def to_decimal(value: Any) -> Decimal | None:
+    """把任意数字/字符串转成有限 ``Decimal``；不可用时返回 ``None``。
+
+    公开别名：**数量换算必须走 Decimal**，否则 ``0.3 / 0.1`` 这类二进制
+    浮点误差会让 ``int()`` 少算一张合约（止损就会漏保护一部分仓位）。
+    """
+    return _to_decimal(value)
 
 
 def to_float(value: Any, default: float = 0.0) -> float:
@@ -291,10 +424,17 @@ def format_decimal(x: Any) -> str:
 
 __all__ = [
     "TradeResult",
+    "ProtectionOrder",
+    "PROTECT_STOP_LOSS",
+    "PROTECT_TAKE_PROFIT_1",
+    "PROTECT_TAKE_PROFIT_2",
+    "plan_protections",
+    "protection_label",
     "MARKET_SPOT",
     "MARKET_FUTURES",
     "ORDER_TYPE_MARKET",
     "ORDER_TYPE_LIMIT",
+    "ORDER_TYPE_TRIGGER",
     "MARGIN_ISOLATED",
     "MARGIN_CROSS",
     "POSITION_LONG",
@@ -308,6 +448,7 @@ __all__ = [
     "normalize_order_type",
     "normalize_margin_mode",
     "normalize_position_side",
+    "to_decimal",
     "to_float",
     "to_text",
     "floor_to_step",

@@ -300,3 +300,55 @@ def test_reorder_keeps_relative_order_of_healthy_entries():
     fallback_health.mark_failed(chain[0])
     # 健康项保持原序在前（m1, m3），冷却项也按链内原序排在后面（m0, m2）。
     assert [c.model for c in fallback_health.reorder(list(chain))] == ["m1", "m3", "m0", "m2"]
+
+
+# ── 变量名容错：daemon 其它键都是 PA_DAEMON_*，只有这一项是 PA_AGENT_* ─────────
+
+
+def test_daemon_prefixed_alias_is_accepted(monkeypatch):
+    """写 ``PA_DAEMON_FALLBACKS`` 也该生效（其它 daemon 键都是这个前缀）。"""
+    monkeypatch.delenv(FALLBACK_SPEC_ENV, raising=False)
+    monkeypatch.setenv(
+        "PA_DAEMON_FALLBACKS", "甲|m1|https://a.example/v1|k1;乙|m2|https://b.example/v1|k2"
+    )
+    entries = env_fallbacks()
+    assert [e.name for e in entries] == ["甲", "乙"]
+
+
+def test_canonical_name_wins_over_the_alias(monkeypatch, caplog):
+    """两个都写时以主名为准，并提示另一个被忽略。"""
+    monkeypatch.setenv(FALLBACK_SPEC_ENV, "主|m|https://a.example/v1|k")
+    monkeypatch.setenv("PA_DAEMON_FALLBACKS", "备|m|https://b.example/v1|k")
+    entries = env_fallbacks()
+    assert [e.name for e in entries] == ["主"]
+    assert any("同时设置" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize(
+    "bad_name",
+    ["PA_AGENT_FALLBACK", "PA_DAEMON_FALLBACK", "PA_AGENT_FALLBACK_POOL", "FALLBACKS"],
+)
+def test_misspelled_variable_is_called_out(monkeypatch, caplog, bad_name):
+    """拼错名字既不报错也不生效，是最难自查的一类问题 —— 至少要点名。"""
+    monkeypatch.delenv(FALLBACK_SPEC_ENV, raising=False)
+    monkeypatch.delenv("PA_DAEMON_FALLBACKS", raising=False)
+    monkeypatch.setenv(bad_name, "甲|m|https://a.example/v1|k")
+    assert env_fallbacks() == []
+    assert any(bad_name in r.getMessage() and "不是有效" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_describe_shows_where_the_pool_came_from(monkeypatch):
+    """启动行要能一眼看出这一轮读的是 env 还是 settings。"""
+    from pa_agent.config.paths import SETTINGS_JSON_PATH
+    from pa_agent.config.settings import load_settings
+    from pa_agent.daemon.config import DaemonConfig
+
+    monkeypatch.delenv(FALLBACK_SPEC_ENV, raising=False)
+    monkeypatch.delenv("PA_DAEMON_FALLBACKS", raising=False)
+    cfg = DaemonConfig(settings=load_settings(SETTINGS_JSON_PATH), settings_path=SETTINGS_JSON_PATH)
+    assert "(settings)" in cfg.describe()
+
+    monkeypatch.setenv(FALLBACK_SPEC_ENV, "甲|m|https://a.example/v1|k;乙|m|https://b.example/v1|k")
+    cfg2 = DaemonConfig(settings=load_settings(SETTINGS_JSON_PATH), settings_path=SETTINGS_JSON_PATH)
+    assert "fallbacks=2(env)" in cfg2.describe()

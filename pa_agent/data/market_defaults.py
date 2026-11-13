@@ -1,13 +1,9 @@
 """Default symbol identifiers for the supported data sources.
 
-本模块只保留 Binance / OKX（加密货币）与 A 股（东方财富 / AkShare / Tushare）
-的品种归一逻辑。MT5 与 TradingView 数据源已从本项目移除。
+本模块只保留 Binance / OKX（加密货币）的品种归一逻辑。MT5、TradingView 以及
+A 股（东方财富 / AkShare / Tushare）数据源已从本项目移除。
 """
 from __future__ import annotations
-
-# AkShare A-share defaults (平安银行 / 日线与 1h 分析常用)
-A_SHARE_DEFAULT_SYMBOL = "000001"
-A_SHARE_DEFAULT_TIMEFRAME = "1h"
 
 #: Binance / OKX 默认品种（中性写法，两端都会归一成各自格式）。
 CRYPTO_DEFAULT_SYMBOL = "BTCUSDT"
@@ -32,13 +28,6 @@ _CRYPTO_QUOTES: tuple[str, ...] = (
 _METAL_BASES: frozenset[str] = frozenset(
     {"XAU", "XAG", "XPT", "XPD", "GLD", "SLV", "GOLD", "SILVER"}
 )
-
-
-def _looks_like_ashare_code(code: str) -> bool:
-    c = (code or "").strip().lower()
-    if len(c) == 6 and c.isdigit():
-        return True
-    return c.startswith(("sh", "sz")) and len(c) >= 8 and c[2:].isdigit()
 
 
 def normalize_crypto_symbol(symbol: str) -> str:
@@ -76,45 +65,22 @@ def normalize_crypto_symbol(symbol: str) -> str:
 
 
 def normalize_gold_symbol_for_kind(kind: str, symbol: str) -> str:
-    """Normalize *symbol* for data-source *kind* (crypto vs A-share).
+    """Normalize *symbol* for data-source *kind*.
 
     函数名保留历史叫法（调用方在 GUI 里已按此名接线），但已不含黄金/MT5 逻辑。
+    现在只支持加密货币交易所，任何 kind 都按交易对归一。
     """
-    from pa_agent.data.ashare_common import normalize_ashare_symbol
-
-    sym = (symbol or "").strip()
-    if kind in ("ashare", "akshare", "tushare"):
-        code = normalize_ashare_symbol(sym)
-        if not code or not _looks_like_ashare_code(code):
-            return A_SHARE_DEFAULT_SYMBOL
-        return code
-    if kind in ("binance", "okx"):
-        return normalize_crypto_symbol(sym)
-    # 未知 kind：统一按加密货币处理，避免把黄金/MT5 品种名带进交易所源。
-    return normalize_crypto_symbol(sym)
-
-
-def normalize_ashare_tv_code(symbol: str) -> str:
-    """Normalize user input to a 6-digit A-share code."""
-    from pa_agent.data.ashare_common import normalize_ashare_symbol
-
-    raw = normalize_ashare_symbol(symbol)
-    if raw.startswith(("sh", "sz")) and len(raw) >= 8:
-        return raw[2:8]
-    digits = "".join(ch for ch in raw if ch.isdigit())
-    if len(digits) >= 6:
-        return digits[-6:]
-    return digits
+    return normalize_crypto_symbol(symbol)
 
 
 def migrate_general_gold_defaults(general: dict) -> None:
     """In-place migration of persisted ``general`` symbol fields.
 
     历史配置里可能残留 ``XAUUSDm`` / ``XAUUSD``（MT5 / TradingView 品种），
-    或已删除的 ``last_tradingview_exchange`` 字段——这里统一清洗。
+    ``000001``（A 股代码），或已删除的 ``last_tradingview_exchange`` 字段
+    —— 这里统一清洗。
     """
-    kind = str(general.get("last_data_source", "binance"))
     sym = str(general.get("last_symbol", ""))
-    general["last_symbol"] = normalize_gold_symbol_for_kind(kind, sym)
+    general["last_symbol"] = normalize_crypto_symbol(sym)
     # TradingView 数据源已移除，残留的交易所字段一并丢弃。
     general.pop("last_tradingview_exchange", None)

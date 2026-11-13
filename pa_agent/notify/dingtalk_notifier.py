@@ -61,6 +61,7 @@ _CONFIG_DEFAULTS: dict[str, Any] = {
     "at_mobiles": [],
     "at_all": False,
     "notify_on_order_only": True,
+    "notify_on_trade_filled": True,
     "msg_type": _DEFAULT_MSG_TYPE,
 }
 
@@ -126,6 +127,7 @@ def _normalize_config(raw: dict[str, Any]) -> dict[str, Any]:
         "at_mobiles": _as_mobile_list(raw.get("at_mobiles")),
         "at_all": bool(raw.get("at_all", False)),
         "notify_on_order_only": bool(raw.get("notify_on_order_only", True)),
+        "notify_on_trade_filled": bool(raw.get("notify_on_trade_filled", True)),
         "msg_type": msg_type,
     }
 
@@ -525,6 +527,216 @@ def send_order_signal(
         return ok
     except Exception as exc:
         logger.warning("钉钉下单信号发送异常: %s", exc)
+        return False
+
+
+# ── 实盘成交回报 ──────────────────────────────────────────────────────────────
+# 与 send_order_signal 的区别：那条推的是「决策意图」（还没下单、可能失败），
+# 这条推的是「交易所已经成交的事实」——真实成交价、真实数量、真实金额、
+# 委托号、以及止损/TP 有没有真的挂到交易所侧。只有 dry_run=False 才会走这里。
+def _safe_float(value: Any) -> float:
+    """容错转 float，失败返回 0.0（本模块不与交易层共享依赖）."""
+    try:
+        if value is None or value == "":
+            return 0.0
+        return float(str(value).strip().replace(",", ""))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _fmt_price(value: Any) -> str:
+    """价格格式化：去掉尾零，并避免 1e-05 这种科学计数法."""
+    num = _safe_float(value)
+    if num <= 0:
+        return "—"
+    text = f"{num:.10f}".rstrip("0").rstrip(".")
+    return text or "—"
+
+
+def _fmt_money(value: Any) -> str:
+    """金额（USDT）格式化：>=100 用千分位两位小数，小额保留 4 位去尾零."""
+    num = _safe_float(value)
+    if num <= 0:
+        return "—"
+    if abs(num) >= 100:
+        return f"{num:,.2f}"
+    return f"{num:.4f}".rstrip("0").rstrip(".")
+
+
+def _side_label(side: str) -> str:
+    """BUY/SELL → 带 emoji 的中文方向."""
+    s = (side or "").strip().upper()
+    if s == "BUY":
+        return "🟢 做多（BUY）"
+    if s == "SELL":
+        return "🔴 做空（SELL）"
+    return _fmt(side)
+
+
+_MARKET_LABELS = {"spot": "现货", "futures": "合约"}
+_MODE_LABELS = {"cross": "全仓", "isolated": "逐仓"}
+
+
+def _build_trade_markdown(
+    *,
+    venue: str,
+    symbol: str,
+    order_id: str,
+    side: str,
+    order_type: str,
+    fill_price: Any,
+    qty: Any,
+    notional_usdt: Any,
+    margin_usdt: Any,
+    leverage: Any,
+    margin_mode: str,
+    market_type: str,
+    executed_at: str,
+    protections: Any = None,
+    pending_trigger: bool = False,
+    trigger_price: Any = None,
+) -> tuple[str, str]:
+    """构建实盘成交回报的 (title, markdown_text)."""
+    venue_label = "OKX" if (venue or "").lower() == "okx" else (
+        "Binance" if (venue or "").lower() == "binance" else _fmt(venue)
+    )
+    market_label = _MARKET_LABELS.get((market_type or "").lower(), _fmt(market_type))
+    mode_label = _MODE_LABELS.get((margin_mode or "").lower(), _fmt(margin_mode))
+    lev = int(_safe_float(leverage) or 1)
+
+    if pending_trigger:
+        title = f"🕒 PA Agent 计划委托已挂 — {symbol}"
+    else:
+        title = f"✅ PA Agent 实盘成交 — {symbol}"
+
+    lines = [f"#### {title}"]
+
+    venue_line = f"{venue_label} · {market_label}"
+    if market_label == "合约":
+        venue_line += f" · {mode_label} {lev}x"
+    lines.append(f"- **交易所**：{venue_line}")
+    lines.append(f"- **交易对**：{_fmt(symbol)}")
+    lines.append(f"- **方向**：{_side_label(side)}")
+
+    if pending_trigger:
+        lines.append(f"- **触发价**：{_fmt_price(trigger_price)}（尚未成交）")
+    else:
+        lines.append(f"- **开仓价（成交均价）**：{_fmt_price(fill_price)}")
+        lines.append(f"- **数量**：{_fmt_price(qty)}")
+        notional_text = _fmt_money(notional_usdt)
+        margin_text = _fmt_money(margin_usdt)
+        if market_label == "合约" and margin_text != "—":
+            lines.append(f"- **下单金额**：名义 {notional_text} USDT（保证金 {margin_text} USDT）")
+        else:
+            lines.append(f"- **下单金额**：{notional_text} USDT")
+
+    lines.append(f"- **下单时间**：{_fmt(executed_at)}")
+    lines.append(f"- **订单类型**：{_fmt(order_type)}")
+    lines.append(f"- **委托号**：{_fmt(order_id)}")
+
+    legs = list(protections or [])
+    if legs:
+        lines.append("")
+        lines.append("**🛡 保护单（交易所侧）**")
+        for leg in legs:
+            kind = str(getattr(leg, "kind", "") or "")
+            ok = bool(getattr(leg, "ok", False))
+            price = _fmt_price(getattr(leg, "trigger_price", 0))
+            label = _PROTECT_KIND_LABELS.get(kind, kind or "保护单")
+            if ok:
+                oid = str(getattr(leg, "order_id", "") or "")
+                suffix = f"（{oid}）" if oid else ""
+                lines.append(f"- {label}：{price} 已挂{suffix}")
+            else:
+                reason = _truncate(str(getattr(leg, "message", "") or "").strip(), 120)
+                lines.append(f"- {label}：{price} ⚠ 未挂：{reason or '未知原因'}")
+    elif pending_trigger:
+        lines.append("")
+        lines.append("**🛡 保护单**：计划委托尚未触发，触发成交后自动补挂止损 / TP1 / TP2。")
+    else:
+        lines.append("")
+        lines.append("**🛡 保护单**：本次未提交保护单（未启用或决策缺止盈止损价），请人工核对持仓。")
+
+    return title, "\n".join(lines)
+
+
+#: 保护单类型 → 中文标签（与 trading.common 保持一致，但这里不 import 交易层，
+#: 以免 notify 模块被牵连进交易依赖）
+_PROTECT_KIND_LABELS: dict[str, str] = {
+    "stop_loss": "止损",
+    "take_profit_1": "TP1",
+    "take_profit_2": "TP2",
+}
+
+
+def send_trade_report(
+    *,
+    venue: str,
+    symbol: str,
+    order_id: str,
+    side: str,
+    order_type: str,
+    fill_price: Any,
+    qty: Any,
+    notional_usdt: Any,
+    margin_usdt: Any,
+    leverage: Any,
+    margin_mode: str,
+    market_type: str,
+    executed_at: str,
+    protections: Any = None,
+    pending_trigger: bool = False,
+    trigger_price: Any = None,
+    settings: "Settings | None" = None,
+) -> bool:
+    """推送一条「实盘已成交」回报到钉钉群。
+
+    只在真实下单（``dry_run=False``）且交易所已受理时调用；试运行绝不推送。
+    ``notify_on_trade_filled=False`` 时直接跳过（返回 False）。
+
+    Returns
+    -------
+    bool
+        发送成功 True；未启用 / 未配置 / 被开关关闭 / 推送失败均返回 False。
+    """
+    try:
+        cfg = _dingtalk_config_dict(settings)
+        if not (cfg["enabled"] and cfg["webhook_url"]):
+            logger.debug("钉钉通知未启用或未配置 webhook_url，跳过成交回报")
+            return False
+        if not cfg.get("notify_on_trade_filled", True):
+            logger.debug("钉钉成交回报已关闭（notify_on_trade_filled=false），跳过")
+            return False
+
+        title, markdown_text = _build_trade_markdown(
+            venue=venue,
+            symbol=symbol,
+            order_id=order_id,
+            side=side,
+            order_type=order_type,
+            fill_price=fill_price,
+            qty=qty,
+            notional_usdt=notional_usdt,
+            margin_usdt=margin_usdt,
+            leverage=leverage,
+            margin_mode=margin_mode,
+            market_type=market_type,
+            executed_at=executed_at,
+            protections=protections,
+            pending_trigger=pending_trigger,
+            trigger_price=trigger_price,
+        )
+        payload = _build_payload(
+            markdown_text,
+            cfg=cfg,
+            title=title,
+            at_mobiles=cfg["at_mobiles"],
+            at_all=cfg["at_all"],
+        )
+        ok, _ = _post(payload, cfg, action="钉钉成交回报")
+        return ok
+    except Exception as exc:  # noqa: BLE001 - 通知失败绝不能影响交易
+        logger.warning("钉钉成交回报发送异常: %s", exc)
         return False
 
 

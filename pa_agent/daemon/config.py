@@ -171,6 +171,28 @@ def _notify_active(channel: str, settings: Settings) -> bool:
         return bool(getattr(section, "enabled", False))
 
 
+def _fallback_pool_summary(settings: Settings) -> str:
+    """启动行里的备用池摘要，例如 ``4(env)`` / ``3(settings)`` / ``0``。
+
+    用户「改了 .env 没生效」时，最先要能一眼看出**这一轮到底读了哪一份**：
+    括号里是 ``env`` 说明环境变量赢了，``settings`` 说明没读到环境变量。
+    只报条数与来源，绝不包含 Key 或 URL。
+    """
+    try:
+        from pa_agent.ai.extra_providers import read_fallback_spec
+
+        raw, _name = read_fallback_spec()
+        if raw:
+            count = len([p for p in raw.split(";") if p.strip()])
+            return f"{count}(env)"
+    except Exception:  # noqa: BLE001 - 摘要失败不能拖垮启动
+        pass
+    try:
+        return str(len(getattr(settings, "ai_backups", None) or [])) + "(settings)"
+    except Exception:  # noqa: BLE001
+        return "?"
+
+
 def apply_fallback_env_overrides(settings: Settings) -> list[str]:
     """把 ``.env`` 里的 ``PA_AGENT_FALLBACKS`` 解析成备用池。
 
@@ -180,30 +202,45 @@ def apply_fallback_env_overrides(settings: Settings) -> list[str]:
 
     返回被应用的变量名（供启动日志打印来源），绝不返回 Key。
     """
-    from pa_agent.ai.extra_providers import FALLBACK_SPEC_ENV, parse_fallback_spec
+    from pa_agent.ai.extra_providers import parse_fallback_spec, read_fallback_spec
 
-    raw = str(os.environ.get(FALLBACK_SPEC_ENV, "") or "").strip()
+    raw, var_name = read_fallback_spec()
     if not raw:
         return []
     entries, problems = parse_fallback_spec(
         raw, default_key=str(settings.provider.api_key or "").strip()
     )
     for problem in problems:
-        logger.warning("%s %s，已跳过", FALLBACK_SPEC_ENV, problem)
+        logger.warning("%s %s，已跳过", var_name, problem)
     if not entries:
         logger.warning(
             "%s 已设置但没有任何可解析的条目，继续使用 settings.json 里的备用池",
-            FALLBACK_SPEC_ENV,
+            var_name,
         )
         return []
     settings.ai_backups = entries
     logger.info(
         "%s 覆盖了备用池：%d 条（%s）",
-        FALLBACK_SPEC_ENV,
+        var_name,
         len(entries),
         ", ".join(str(getattr(e, "name", "") or e.model) for e in entries),
     )
-    return [FALLBACK_SPEC_ENV]
+    return [var_name]
+
+
+def apply_all_env_overrides(settings: Settings) -> list[str]:
+    """把四组环境变量覆盖一次性套到 *settings* 上。
+
+    启动（``from_env``）与热重载（``DaemonRunner._reload_if_settings_changed``）
+    必须走同一套逻辑，否则「改 .env 后热重载」会漏掉某些项，出现只有重启才
+    生效的诡异差异。返回被应用的变量名（绝不返回值本身）。
+    """
+    applied: list[str] = []
+    applied += apply_provider_env_overrides(settings)
+    applied += apply_fallback_env_overrides(settings)
+    applied += apply_exchange_env_overrides(settings)
+    applied += apply_auto_trade_env_overrides(settings)
+    return applied
 
 
 def apply_exchange_env_overrides(settings: Settings) -> list[str]:
@@ -367,6 +404,45 @@ def apply_auto_trade_env_overrides(settings: Settings) -> list[str]:
                 margin_mode,
             )
 
+    # 开仓后挂保护单（止损 / TP1 / TP2）：这属于下单方式而不是风控上限，
+    # 所以留了环境变量通道；但 tp1_fraction 必须是 (0, 1) 里的真分数，
+    # 否则止盈会变成 0 张或超过整仓。
+    if str(os.environ.get("PA_DAEMON_PROTECT_AFTER_ENTRY", "") or "").strip():
+        auto.protect_after_entry = _env_bool(
+            "PA_DAEMON_PROTECT_AFTER_ENTRY", auto.protect_after_entry
+        )
+        applied.append("PA_DAEMON_PROTECT_AFTER_ENTRY")
+
+    slippage_bps = str(os.environ.get("PA_DAEMON_MAX_SLIPPAGE_BPS", "") or "").strip()
+    if slippage_bps:
+        try:
+            value = float(slippage_bps)
+        except ValueError:
+            value = -1.0
+        if value >= 0:
+            auto.max_slippage_bps = value
+            applied.append("PA_DAEMON_MAX_SLIPPAGE_BPS")
+        else:
+            logger.warning(
+                "环境变量 PA_DAEMON_MAX_SLIPPAGE_BPS=%r 无效（必须是 >=0 的数），已忽略",
+                slippage_bps,
+            )
+
+    tp1_fraction = str(os.environ.get("PA_DAEMON_TP1_FRACTION", "") or "").strip()
+    if tp1_fraction:
+        try:
+            value = float(tp1_fraction)
+        except ValueError:
+            value = 0.0
+        if 0.0 < value < 1.0:
+            auto.tp1_fraction = value
+            applied.append("PA_DAEMON_TP1_FRACTION")
+        else:
+            logger.warning(
+                "环境变量 PA_DAEMON_TP1_FRACTION=%r 无效（必须大于 0 且小于 1），已忽略",
+                tp1_fraction,
+            )
+
     return applied
 
 
@@ -419,10 +495,7 @@ class DaemonConfig:
         """Merge settings.json with environment variables and explicit overrides."""
         path = Path(settings_path) if settings_path is not None else SETTINGS_JSON_PATH
         settings = load_settings(path)
-        applied_env = apply_provider_env_overrides(settings)
-        applied_env += apply_fallback_env_overrides(settings)
-        applied_env += apply_exchange_env_overrides(settings)
-        applied_env += apply_auto_trade_env_overrides(settings)
+        applied_env = apply_all_env_overrides(settings)
         if applied_env:
             logger.info("已从环境变量覆盖配置：%s", ", ".join(applied_env))
         general = settings.general
@@ -521,8 +594,13 @@ class DaemonConfig:
         """Fail fast on obviously broken configuration, before touching网络."""
         from pa_agent.data.factory import normalize_data_source_kind
 
-        normalized = normalize_data_source_kind(self.data_source)
-        if normalized not in ("binance", "okx"):
+        # 先看原始值再归一：normalize_data_source_kind() 会把所有已移除的
+        # 数据源（ashare / akshare / tushare / eastmoney_futures …）静默回落
+        # 成 binance，那样这里的拒绝分支就永远走不到了 —— 用户以为在盯 A 股，
+        # 实际却在盯 BTCUSDT，属于必须报错的配置错误。
+        raw_source = str(self.data_source or "").strip().lower()
+        normalized = normalize_data_source_kind(raw_source)
+        if raw_source and raw_source not in ("binance", "okx"):
             raise ConfigError(
                 f"无头守护进程只支持 binance / okx 数据源，当前为 {self.data_source!r}。"
                 " 请设置 PA_DAEMON_DATA_SOURCE=binance 或 okx。"
@@ -575,6 +653,7 @@ class DaemonConfig:
             f"bars={self.bar_count} poll={self.poll_interval_s:g}s "
             f"cooldown={self.analysis_cooldown_s:g}s wait_close={self.wait_bar_close} "
             f"auto_trade={'on(' + venue + (', dry-run)' if dry else ', LIVE)') if auto.enabled else 'off'} "
+            f"fallbacks={_fallback_pool_summary(self.settings)} "
             f"dingtalk={ding} pushplus={push}"
         )
 

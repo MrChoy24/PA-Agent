@@ -27,6 +27,7 @@ from pa_agent.data.crypto_common import (
     COMMON_SYMBOLS,
     to_binance_symbol,
 )
+from pa_agent.util import throttle
 
 logger = logging.getLogger(__name__)
 
@@ -204,6 +205,8 @@ class BinanceSource(DataSource):
         for host in candidates:
             if not host:
                 continue
+            # 本地节流：行情轮询 + 账户查询共用同一个 Binance 令牌桶。
+            throttle.acquire("binance")
             try:
                 resp = self._client().get(
                     f"{host}{path}", params=params, headers=signed_headers
@@ -455,6 +458,7 @@ class BinanceSource(DataSource):
         headers = {"X-MBX-APIKEY": self._api_key}
         last_exc: Exception | None = None
         for host in _ACCOUNT_HOSTS:
+            throttle.acquire("binance")
             try:
                 return self._client().get(
                     f"{host}/api/v3/account", params=url_params, headers=headers

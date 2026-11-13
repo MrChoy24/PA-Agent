@@ -1,17 +1,14 @@
-"""Symbol normalization for the crypto + A-share data sources.
+"""Symbol normalization for the crypto data sources.
 
-MT5 / TradingView sources were removed, so this suite only covers
-Binance / OKX pair normalization and A-share code normalization.
+MT5 / TradingView / A 股数据源均已移除，本套件只覆盖 Binance / OKX 交易对归一。
 """
 from __future__ import annotations
 
 import pytest
 
 from pa_agent.data.market_defaults import (
-    A_SHARE_DEFAULT_SYMBOL,
     CRYPTO_DEFAULT_SYMBOL,
     migrate_general_gold_defaults,
-    normalize_ashare_tv_code,
     normalize_crypto_symbol,
     normalize_gold_symbol_for_kind,
 )
@@ -50,19 +47,11 @@ def test_unknown_kind_treated_as_crypto() -> None:
     assert normalize_gold_symbol_for_kind("tradingview", "BTCUSDT") == "BTCUSDT"
 
 
-def test_ashare_kinds_keep_six_digit_code() -> None:
-    assert normalize_gold_symbol_for_kind("ashare", "600519") == "600519"
-    assert normalize_gold_symbol_for_kind("akshare", "sh600519") == "600519"
-
-
-def test_ashare_kind_falls_back_to_default_code() -> None:
-    assert normalize_gold_symbol_for_kind("ashare", "BTCUSDT") == A_SHARE_DEFAULT_SYMBOL
-
-
-def test_normalize_ashare_tv_code_strips_prefix_and_keeps_last_six() -> None:
-    assert normalize_ashare_tv_code("sh600519") == "600519"
-    assert normalize_ashare_tv_code("600519") == "600519"
-    assert normalize_ashare_tv_code("") == ""
+def test_removed_ashare_kind_now_normalizes_as_crypto() -> None:
+    """A 股数据源已移除，残留的 ashare kind 不再产出 6 位股票代码。"""
+    assert normalize_gold_symbol_for_kind("ashare", "600519") == CRYPTO_DEFAULT_SYMBOL
+    assert normalize_gold_symbol_for_kind("akshare", "sh600519") == CRYPTO_DEFAULT_SYMBOL
+    assert normalize_gold_symbol_for_kind("tushare", "000001") == CRYPTO_DEFAULT_SYMBOL
 
 
 def test_migrate_general_cleans_legacy_mt5_symbol() -> None:
@@ -81,3 +70,10 @@ def test_migrate_general_keeps_valid_crypto_symbol() -> None:
     general = {"last_data_source": "okx", "last_symbol": "BTC-USDT"}
     migrate_general_gold_defaults(general)
     assert general["last_symbol"] == "BTCUSDT"
+
+
+def test_migrate_general_cleans_legacy_ashare_code() -> None:
+    """历史配置里残留的 A 股 6 位代码要换成合法交易对。"""
+    general = {"last_data_source": "ashare", "last_symbol": "600519"}
+    migrate_general_gold_defaults(general)
+    assert general["last_symbol"] == CRYPTO_DEFAULT_SYMBOL

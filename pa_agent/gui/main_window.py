@@ -395,6 +395,22 @@ class MainWindow(QMainWindow):
         )
         self._demo_mode_label.hide()
         self._status_bar.addWidget(self._demo_mode_label, 1)
+
+        # 实盘自动交易常驻红标：这比日志里的一行 WARNING 显眼得多 ——
+        # 用户开着 GUI 时最该知道的事就是「这台机器现在会真的下单」。
+        self._live_trade_label = QLabel("实盘自动交易已启用")
+        self._live_trade_label.setStyleSheet(
+            "color: #ffffff; background-color: #c62828; font-weight: 700;"
+            " padding: 1px 8px; border-radius: 3px; margin-left: 4px;"
+        )
+        self._live_trade_label.setToolTip(
+            "自动交易已开启且 dry_run=False —— 满足条件时会动用真实资金下单。"
+            " 要改为试运行请在「交易所与自动交易」里勾选「试运行」。"
+        )
+        self._live_trade_label.hide()
+        self._status_bar.addPermanentWidget(self._live_trade_label)
+        self._refresh_live_trade_indicator()
+
         self._status_bar.showMessage("就绪")
         self._refresh_api_key_ui_state()
 
@@ -464,9 +480,7 @@ class MainWindow(QMainWindow):
 
         # Data source
         from pa_agent.data.factory import (
-            ASHARE_SOURCE_LABEL,
             DATA_SOURCE_CHOICES,
-            SHOW_ASHARE_DATA_SOURCE,
             normalize_data_source_kind,
         )
 
@@ -494,24 +508,11 @@ class MainWindow(QMainWindow):
             "· Binance（默认；品种如 BTCUSDT / ETHUSDT）\n"
             "· OKX（品种如 BTCUSDT 或 BTC-USDT）"
         )
-        if SHOW_ASHARE_DATA_SOURCE:
-            _ds_tip += f"\n· {ASHARE_SOURCE_LABEL}（HTTP 直连，含腾讯/免费替补）"
         self._data_source_combo.setToolTip(_ds_tip)
         self._data_source_combo.currentIndexChanged.connect(
             self._on_data_source_combo_changed
         )
         ctrl_layout.addWidget(self._data_source_combo)
-
-        # 品种选择 (仅东方财富期货数据源显示, 两级选择: 品种→合约)
-        self._variety_label = QLabel("品种:")
-        self._variety_combo = QComboBox()
-        self._variety_combo.setMinimumWidth(120)
-        self._variety_combo.setToolTip("选择品种大类, 再在右侧选择具体合约")
-        self._variety_combo.currentIndexChanged.connect(
-            self._on_variety_combo_changed
-        )
-        ctrl_layout.addWidget(self._variety_label)
-        ctrl_layout.addWidget(self._variety_combo)
 
         # 合约/品种 — editable combo (user can type any symbol)
         self._symbol_label = QLabel("合约:")
@@ -780,8 +781,6 @@ class MainWindow(QMainWindow):
         if settings is not None:
             interval_ms = getattr(settings.general, "refresh_interval_ms", 1000)
             n_bars = self._analysis_bar_count()
-        if self._current_data_source_kind() in ("ashare", "akshare", "tushare") and interval_ms < 2500:
-            interval_ms = 2500
 
         self._refresh_cancel_token = CancelToken()
         self._refresh_loop = RefreshLoop(
@@ -1017,10 +1016,7 @@ class MainWindow(QMainWindow):
 
     def _apply_gold_defaults_for_data_source(self, kind: str) -> None:
         """Reset symbol to a valid default when switching data source."""
-        from pa_agent.data.market_defaults import (
-            A_SHARE_DEFAULT_TIMEFRAME,
-            normalize_gold_symbol_for_kind,
-        )
+        from pa_agent.data.market_defaults import normalize_gold_symbol_for_kind
 
         sym = normalize_gold_symbol_for_kind(
             kind, self._symbol_combo.currentText().strip()
@@ -1028,25 +1024,13 @@ class MainWindow(QMainWindow):
         self._symbol_combo.blockSignals(True)
         self._symbol_combo.setCurrentText(sym)
         self._symbol_combo.blockSignals(False)
-        if kind in ("ashare", "akshare"):
-            if self._tf_combo.currentText() not in ("1h", "4h", "1d"):
-                self._tf_combo.setCurrentText(A_SHARE_DEFAULT_TIMEFRAME)
 
     def _apply_data_source_symbol_placeholder(self) -> None:
         line = self._symbol_combo.lineEdit()
         if line is None:
             return
         kind = self._current_data_source_kind()
-        # 东方财富期货: 两级选择 (品种→合约), 显示品种下拉框, 标签改"合约"
-        is_futures = kind == "eastmoney_futures"
-        self._variety_label.setVisible(is_futures)
-        self._variety_combo.setVisible(is_futures)
-        self._symbol_label.setText("合约:" if is_futures else "品种:")
-        if kind == "eastmoney_futures":
-            line.setPlaceholderText("选择左侧品种后在此选合约, 或直接输入如 AO2509")
-        elif kind in ("ashare", "akshare", "tushare"):
-            line.setPlaceholderText("A股 6 位代码，如 600519；指数 000300 或 sh000300")
-        elif kind == "binance":
+        if kind == "binance":
             line.setPlaceholderText("Binance 交易对，如 BTCUSDT / ETHUSDT")
         elif kind == "okx":
             line.setPlaceholderText("OKX 交易对，如 BTCUSDT 或 BTC-USDT")
@@ -1066,12 +1050,6 @@ class MainWindow(QMainWindow):
         data_source = getattr(self._ctx, "data_source", None)
         current = self._symbol_combo.currentText().strip()
         kind = self._current_data_source_kind()
-
-        # 东方财富期货: 两级选择 (品种 → 合约)
-        if kind == "eastmoney_futures" and data_source is not None:
-            self._populate_futures_variety_and_contracts(data_source, current)
-            self._apply_data_source_symbol_placeholder()
-            return
 
         symbols: list[str] = []
         if data_source is not None and getattr(data_source, "_connected", False):
@@ -1170,78 +1148,6 @@ class MainWindow(QMainWindow):
             except RuntimeError:
                 continue
 
-    def _populate_futures_variety_and_contracts(
-        self, data_source: object, current: str
-    ) -> None:
-        """填充期货品种下拉框 + 合约下拉框 (两级选择)."""
-        varieties: list[str] = []
-        try:
-            varieties = list(data_source.list_symbols())  # type: ignore[attr-defined]
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("list_symbols failed: %s", exc)
-
-        # 1. 品种下拉框
-        self._variety_combo.blockSignals(True)
-        self._variety_combo.clear()
-        self._variety_combo.addItems(varieties)
-        variety_idx = 0
-        if current:
-            cur_code = current.split()[0].upper() if current.split() else ""
-            for i, v in enumerate(varieties):
-                v_code = v.split()[0].upper() if v.split() else ""
-                if v_code and (v_code == cur_code or cur_code.startswith(v_code)):
-                    variety_idx = i
-                    break
-        if variety_idx < self._variety_combo.count():
-            self._variety_combo.setCurrentIndex(variety_idx)
-        self._variety_combo.blockSignals(False)
-
-        # 2. 合约下拉框 (基于选中品种生成)
-        selected_variety = self._variety_combo.currentText()
-        contracts: list[str] = []
-        try:
-            contracts = list(data_source.generate_contracts(selected_variety))  # type: ignore[attr-defined]
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("generate_contracts failed: %s", exc)
-        self._symbol_combo.blockSignals(True)
-        self._symbol_combo.clear()
-        if contracts:
-            self._symbol_combo.addItems(contracts)
-        if current:
-            idx = self._symbol_combo.findText(current)
-            if idx >= 0:
-                self._symbol_combo.setCurrentIndex(idx)
-            elif contracts:
-                self._symbol_combo.setCurrentIndex(0)
-        elif contracts:
-            self._symbol_combo.setCurrentIndex(0)
-        self._symbol_combo.blockSignals(False)
-
-    def _on_variety_combo_changed(self, index: int) -> None:
-        """品种下拉框切换 → 重新生成合约列表."""
-        if getattr(self, "_switching", False):
-            return
-        kind = self._current_data_source_kind()
-        if kind != "eastmoney_futures":
-            return
-        data_source = getattr(self._ctx, "data_source", None)
-        if data_source is None:
-            return
-        variety_text = self._variety_combo.currentText()
-        if not variety_text:
-            return
-        try:
-            contracts = list(data_source.generate_contracts(variety_text))  # type: ignore[attr-defined]
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("generate_contracts failed: %s", exc)
-            return
-        self._symbol_combo.blockSignals(True)
-        self._symbol_combo.clear()
-        if contracts:
-            self._symbol_combo.addItems(contracts)
-            self._symbol_combo.setCurrentIndex(0)  # 默认主力
-        self._symbol_combo.blockSignals(False)
-
     def _populate_timeframe_combo_for_source(self) -> None:
         data_source = getattr(self._ctx, "data_source", None)
         preferred = ["1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"]
@@ -1338,13 +1244,7 @@ class MainWindow(QMainWindow):
             if not timeframe:
                 # 周期下拉框为空时（切换前没有可用数据源）不至于直接抛
                 # Unsupported timeframe: ''，按目标数据源给一个合法默认周期。
-                from pa_agent.data.market_defaults import A_SHARE_DEFAULT_TIMEFRAME
-
-                timeframe = (
-                    A_SHARE_DEFAULT_TIMEFRAME
-                    if kind in ("ashare", "akshare", "tushare")
-                    else "15m"
-                )
+                timeframe = "15m"
 
             new_source = create_data_source(kind)
             new_source.connect()
@@ -2820,13 +2720,7 @@ class MainWindow(QMainWindow):
         if data_source is not None:
             new_symbol_raw = self._symbol_combo.currentText().strip()
             new_tf = self._tf_combo.currentText().strip()
-            # 东方财富期货: 下拉框显示 "AO0 主力", 数据源内部存 normalize 后的 "AO0",
-            # 需 normalize 后比较, 否则每次提交都误触发切换导致分析无法启动.
-            if self._current_data_source_kind() == "eastmoney_futures":
-                from pa_agent.data.eastmoney_futures_source import normalize_futures_symbol
-                new_symbol = normalize_futures_symbol(new_symbol_raw)
-            else:
-                new_symbol = new_symbol_raw
+            new_symbol = new_symbol_raw
             cur_symbol = str(getattr(data_source, "_symbol", "") or "").strip()
             cur_tf = str(getattr(data_source, "_timeframe", "") or "").strip()
             if new_symbol and (new_symbol != cur_symbol or new_tf != cur_tf):
@@ -4115,6 +4009,15 @@ class MainWindow(QMainWindow):
                 "max_price_deviation_pct": float(
                     getattr(cfg, "max_price_deviation_pct", 0.3) or 0.0
                 ),
+                # 开仓后立刻挂保护单（止损 / TP1 / TP2）到交易所侧
+                "protect_after_entry": bool(
+                    getattr(cfg, "protect_after_entry", True)
+                ),
+                "tp1_fraction": float(getattr(cfg, "tp1_fraction", 0.5) or 0.5),
+                # 成交价 vs 决策入场价的偏差告警（bps，0 关闭）
+                "max_slippage_bps": float(
+                    getattr(cfg, "max_slippage_bps", 30.0) or 0.0
+                ),
             }
         venue = str(opts.get("venue") or "").lower()
         if not venue:
@@ -4160,6 +4063,18 @@ class MainWindow(QMainWindow):
             outcome.reason,
         )
         self._last_auto_trade_outcome = outcome
+        try:
+            from pa_agent.notify.trade_report import notify_trade_outcome
+
+            notify_trade_outcome(
+                outcome,
+                settings=getattr(self._ctx, "settings", None),
+                venue=venue,
+                symbol=symbol,
+                timeframe=timeframe,
+            )
+        except Exception as exc:  # noqa: BLE001 - 通知失败不影响交易
+            logger.warning("实盘成交回报推送异常（忽略）：%s", exc)
 
     def _maybe_alert_order_opportunity(self, decision_inner: dict) -> bool:
         """Beep, popup, and focus decision tab when stage-2 proposes an order."""
@@ -4274,6 +4189,22 @@ class MainWindow(QMainWindow):
         settings = getattr(self._ctx, "settings", None)
         return provider_api_key_configured(settings)
 
+    def _refresh_live_trade_indicator(self) -> None:
+        """按当前配置显示/隐藏状态栏的「实盘自动交易已启用」红标。
+
+        covered: ``auto_trade.enabled`` 为真且 ``dry_run`` 为假。每次配置
+        变更（参数条、设置对话框）后都要重算，否则用户关掉实盘后红标还在。
+        """
+        label = getattr(self, "_live_trade_label", None)
+        if label is None:
+            return
+        settings = getattr(self._ctx, "settings", None)
+        auto = getattr(settings, "auto_trade", None) if settings else None
+        live = bool(getattr(auto, "enabled", False)) and not bool(
+            getattr(auto, "dry_run", True)
+        )
+        label.setVisible(live)
+
     def _refresh_api_key_ui_state(self) -> None:
         """Show or hide API Key warning and sync submit button state."""
         configured = self._has_api_key_configured()
@@ -4352,6 +4283,8 @@ class MainWindow(QMainWindow):
             if bar is not None:
                 bar.load_from_settings(settings)
                 bar.setVisible(self._order_params_visible())
+            # 也可能把 dry_run 从 True 改成 False（或反过来）—— 红标要跟着变
+            self._refresh_live_trade_indicator()
 
     # ── 下单参数条 ────────────────────────────────────────────────────────────
 
@@ -4377,15 +4310,30 @@ class MainWindow(QMainWindow):
             payload.get("margin_mode", ""),
         )
         # 参数改动后让左侧「实时」页的状态栏给一句轻提示，用户能确认已生效。
+        save_ok = True
         try:
             settings = self._ctx.settings
             if settings is not None:
                 from pa_agent.config.paths import SETTINGS_JSON_PATH
-                from pa_agent.config.settings import save_settings
+                from pa_agent.config.settings import loaded_digest, save_settings
 
-                save_settings(settings, SETTINGS_JSON_PATH)
+                # 带指纹写：若服务器上的 daemon 或另一个实例已经改过这个文件，
+                # 拒绝覆盖并在界面上明确告诉用户，而不是静默把对方改动抹掉。
+                save_ok = save_settings(
+                    settings, SETTINGS_JSON_PATH, base_digest=loaded_digest()
+                )
         except Exception as exc:  # noqa: BLE001 - 落盘失败不影响本次会话
             logger.warning("下单参数保存失败（本次会话仍生效）: %s", exc)
+        if not save_ok:
+            QMessageBox.warning(
+                self,
+                "配置已被外部修改",
+                "config/settings.json 在本次打开期间被其他程序（例如服务器上的"
+                " 无头守护进程）修改过，本次改动**未写入磁盘**（参数已在本窗口生效）。\n\n"
+                "请关闭并重新打开程序后再改一次，否则会覆盖对方的修改。",
+            )
+            self.statusBar().showMessage("下单参数未写入磁盘：配置文件已被外部修改", 8000)
+            return
         try:
             label = "币安" if venue == "binance" else ("OKX" if venue == "okx" else venue)
             if market_type == "futures":

@@ -264,3 +264,60 @@ def test_format_decimal_strips_trailing_zeros() -> None:
 def test_trade_result_defaults() -> None:
     r = TradeResult(ok=False, message="boom")
     assert r.ok is False and r.qty == 0.0 and r.raw == {}
+
+
+# ── P1-2（2026-11-14）：逐仓名义金额也必须受 max_notional_usdt 封顶 ──────────
+@pytest.mark.parametrize(
+    ("margin", "leverage", "cap"),
+    [
+        (15.0, 10, 20.0),   # 150 → 20
+        (100.0, 10, 20.0),  # 1000 → 20
+        (100.0, 125, 20.0),  # 12500 → 20（旧实现会真按 12500 下单）
+        (10.0, 10, 15.0),   # 100 → 15（当前线上配置的形状）
+    ],
+)
+def test_isolated_margin_notional_is_capped(
+    log_path: Path, margin: float, leverage: int, cap: float
+) -> None:
+    """逐仓「每单保证金 × 杠杆」不得突破 max_notional_usdt。"""
+    trader = _trader(
+        log_path,
+        market_type="futures",
+        margin_mode="isolated",
+        margin_per_trade_usdt=margin,
+        leverage=leverage,
+        max_notional_usdt=cap,
+    )
+    trader._venue_reference_price = lambda symbol, force=False: 60000.0  # type: ignore[assignment]
+    out = trader.evaluate(
+        _decision(), symbol="BTCUSDT", timeframe="15m", last_price=60000.0
+    )
+    assert out.executed is True
+    assert out.result is not None
+    raw = out.result.raw or {}
+    assert raw["notional_usdt"] == pytest.approx(cap)
+    assert raw["clamped"] is True
+    # 保证金同步反推，不能还报「面板保证金」
+    assert raw["margin_usdt"] == pytest.approx(cap / leverage)
+    assert "已收敛到 max_notional_usdt" in out.result.message
+    assert out.result.qty * 60000.0 <= cap * 1.001
+
+
+def test_isolated_margin_below_cap_is_untouched(log_path: Path) -> None:
+    """没超上限时逐仓仍按「保证金 × 杠杆」走，且不标记 clamped。"""
+    trader = _trader(
+        log_path,
+        market_type="futures",
+        margin_mode="isolated",
+        margin_per_trade_usdt=1.0,
+        leverage=10,
+        max_notional_usdt=20.0,
+    )
+    trader._venue_reference_price = lambda symbol, force=False: 60000.0  # type: ignore[assignment]
+    out = trader.evaluate(
+        _decision(), symbol="BTCUSDT", timeframe="15m", last_price=60000.0
+    )
+    raw = (out.result.raw if out.result else {}) or {}
+    assert raw["notional_usdt"] == pytest.approx(10.0)
+    assert raw["margin_usdt"] == pytest.approx(1.0)
+    assert raw["clamped"] is False

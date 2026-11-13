@@ -28,6 +28,7 @@ from pa_agent.data.crypto_common import (
     COMMON_SYMBOLS,
     to_okx_inst_id,
 )
+from pa_agent.util import endpoints, throttle
 
 logger = logging.getLogger(__name__)
 
@@ -48,11 +49,11 @@ _TF_MAP: dict[str, str] = {
     "1M":  "1M",
 }
 
-# 备用主机：按顺序尝试，记住本次会话中第一个可用的
-_HOSTS: tuple[str, ...] = (
-    "https://www.okx.com",
-    "https://aws.okx.com",
-)
+# 首选主机常量（历史名 ``_HOSTS`` 保留，供模块内探测逻辑兜底引用）。
+# 实际候选列表来自 ``pa_agent.util.endpoints.okx_hosts()``：默认只有
+# www.okx.com，``aws.okx.com`` 在很多网络下 DNS 解析失败，不再默认当备用
+# （可用环境变量 PA_AGENT_OKX_HOSTS 追加）。
+_HOSTS: tuple[str, ...] = (endpoints.OKX_DEFAULT_HOST,)
 
 # 同一 instId+bar 的响应缓存时长（秒），避免 1Hz 刷新重复请求
 _CACHE_TTL_S = 0.7
@@ -145,10 +146,10 @@ class OKXSource(DataSource):
             return _RESOLVED_HOST
         now = time.monotonic()
         if now < _HOST_RETRY_AFTER:
-            return _HOSTS[0]
+            return endpoints.okx_hosts()[0]
         client = self._client()
         last_error = ""
-        for host in _HOSTS:
+        for host in endpoints.okx_hosts():
             try:
                 resp = client.get(f"{host}/api/v5/public/time", timeout=_PROBE_TIMEOUT_S)
             except Exception as exc:  # noqa: BLE001 — 逐个主机降级
@@ -164,19 +165,23 @@ class OKXSource(DataSource):
         # 全部主机失败：不抛错，暂用首选主机，冷却一段时间后再重试
         _HOST_RETRY_AFTER = time.monotonic() + _HOST_RETRY_COOLDOWN_S
         logger.warning("OKX no host reachable (%s); will retry later", last_error)
-        return _HOSTS[0]
+        return endpoints.okx_hosts()[0]
 
     def _get(self, path: str, params: dict | None = None, *, headers: dict | None = None):
         """GET against the resolved host, walking the fallback list on failure."""
+        hosts = list(endpoints.okx_hosts())
         candidates = (
-            [self._host] + [h for h in _HOSTS if h != self._host]
+            [self._host] + [h for h in hosts if h != self._host]
             if self._host
-            else list(_HOSTS)
+            else hosts
         )
         tried: list[str] = []
         for host in candidates:
             if not host:
                 continue
+            # 与交易侧共用一个令牌桶：行情 1Hz 刷新 + 后端轮询叠加时，
+            # 不加节流很容易在短时间内打出几十个请求。
+            throttle.acquire("okx")
             try:
                 resp = self._client().get(
                     f"{host}{path}", params=params, headers=headers
@@ -194,8 +199,7 @@ class OKXSource(DataSource):
                 continue
             self._host = host
             return resp
-        detail = "; ".join(tried) or "unknown network error"
-        raise DataSourceTransientError(f"OKX 请求失败: {detail}")
+        raise DataSourceTransientError(endpoints.unreachable_hint(tried))
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 

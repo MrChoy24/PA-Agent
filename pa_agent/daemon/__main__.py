@@ -44,37 +44,57 @@ def main(argv: list[str] | None = None) -> int:
         runner.print_health(ok, problems)
         return 0 if ok else 1
 
+    # 单实例保护：与 GUI 共用 settings.json，同时运行会导致重复下单。
+    # 只做本机互斥（GUI 在本机、daemon 在服务器时各自一把锁，互不干扰）。
+    from pa_agent.util import instance_lock
+
     try:
-        runner.build()
-    except Exception as exc:  # noqa: BLE001
-        logger.error("启动失败：%s", exc)
+        # acquire() 在构造时就把占用检查做完，异常在这里当场抛出。
+        # （早期版本用 @contextmanager，异常只在 __enter__() 里抛，
+        #  这个 try/except 完全接不住 —— 2026-11-14 服务器日志里
+        #  每 61 秒一屏 traceback 就是这么来的。）
+        lock_ctx = instance_lock.acquire(
+            "daemon", path=cfg.settings_path.parent / instance_lock.LOCK_FILE_NAME
+        )
+    except RuntimeError as exc:
+        logger.error("启动被拒绝：%s", exc)
         print(f"[启动失败] {exc}", file=sys.stderr)
         return 1
 
-    if getattr(args, "dry_run_trade", False):
-        cfg.settings.auto_trade.dry_run = True
-        logger.warning("--dry-run-trade 生效：自动交易强制走试运行")
-
     try:
-        if getattr(args, "once", False):
-            outcome = runner.tick(force=True)
-            print(f"[once] ran={outcome.ran} reason={outcome.reason}")
-            if outcome.decision:
-                d = outcome.decision
-                print(
-                    f"[once] order_type={d.get('order_type', '—')} "
-                    f"confidence={d.get('trade_confidence', '—')} "
-                    f"direction={d.get('direction', '—')}"
-                )
-                if outcome.notified:
-                    print(f"[once] 已推送：{', '.join(outcome.notified)}")
-                if outcome.trade_reason:
-                    print(f"[once] 自动交易：{outcome.trade_reason}")
-            return 0 if outcome.ran else 3
-        runner.run_forever()
-        return 0
+        try:
+            runner.build()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("启动失败：%s", exc)
+            print(f"[启动失败] {exc}", file=sys.stderr)
+            return 1
+
+        if getattr(args, "dry_run_trade", False):
+            cfg.settings.auto_trade.dry_run = True
+            logger.warning("--dry-run-trade 生效：自动交易强制走试运行")
+
+        try:
+            if getattr(args, "once", False):
+                outcome = runner.tick(force=True)
+                print(f"[once] ran={outcome.ran} reason={outcome.reason}")
+                if outcome.decision:
+                    d = outcome.decision
+                    print(
+                        f"[once] order_type={d.get('order_type', '—')} "
+                        f"confidence={d.get('trade_confidence', '—')} "
+                        f"direction={d.get('direction', '—')}"
+                    )
+                    if outcome.notified:
+                        print(f"[once] 已推送：{', '.join(outcome.notified)}")
+                    if outcome.trade_reason:
+                        print(f"[once] 自动交易：{outcome.trade_reason}")
+                return 0 if outcome.ran else 3
+            runner.run_forever()
+            return 0
+        finally:
+            runner.shutdown()
     finally:
-        runner.shutdown()
+        lock_ctx.release()
 
 
 def _apply_log_level(level_name: str) -> None:

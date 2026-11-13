@@ -2,7 +2,6 @@
 #
 # 和 pyproject.toml 的 dependencies 相比，这里**刻意不含**：
 #   PyQt6, pyqtgraph, pywin32  —— 服务器没有图形界面
-#   akshare, baostock, tushare, curl_cffi —— A股数据源，守护进程只用 Binance/OKX
 #   pandas / numpy —— 非 GUI 代码里没有模块级依赖，只有 trade_logger 画图时才用到
 #
 # 想保留「交易记录 CSV 旁附带 K 线 PNG」的话，解开下面 matplotlib 的注释。

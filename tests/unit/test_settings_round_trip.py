@@ -106,14 +106,18 @@ def test_pushplus_round_trip(tmp_path):
     assert loaded.pushplus.enabled is False
 
 
-def test_tushare_round_trip(tmp_path):
-    """save → load preserves tushare token."""
+def test_removed_tushare_section_is_dropped(tmp_path):
+    """A 股 / Tushare 段已从 Settings 移除；历史 settings.json 里的残留段应被忽略，
+    且下次保存时不再写回。"""
     p = tmp_path / "settings.json"
-    original = Settings()
-    original.tushare.token = "ts-test-token"
-    save_settings(original, p)
+    p.write_text(
+        '{"tushare": {"token": "ts-test-token"}, "general": {"last_symbol": "BTCUSDT"}}',
+        encoding="utf-8",
+    )
     loaded = load_settings(p)
-    assert loaded.tushare.token == "ts-test-token"
+    assert not hasattr(loaded, "tushare")
+    save_settings(loaded, p)
+    assert "tushare" not in p.read_text(encoding="utf-8")
 
 
 def test_pushplus_auto_disabled_when_enabled_without_token(tmp_path):

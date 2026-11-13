@@ -5,14 +5,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 DecisionStance = Literal["conservative", "balanced", "aggressive", "extreme_aggressive"]
-DataSourceKind = Literal[
-    "binance",
-    "okx",
-    "ashare",
-    "akshare",
-    "eastmoney_futures",
-    "tushare",
-]
+DataSourceKind = Literal["binance", "okx"]
 NormalizationMode = Literal["strict", "lenient"]
 
 
@@ -91,8 +84,6 @@ class GeneralSettings(BaseModel):
     refresh_interval_ms: int = 1000
     context_warning_threshold_pct: float = 99_999_999.0
     last_data_source: DataSourceKind = "binance"
-    #: A-share K-line adjust for East Money / Baostock (qfq=前复权)
-    kline_adjust: Literal["qfq", "hfq", "none"] = "qfq"
     last_symbol: str = "BTCUSDT"
     last_timeframe: str = "15m"
     decision_flow_auto_play: bool = True
@@ -125,13 +116,21 @@ class GeneralSettings(BaseModel):
     @field_validator("last_data_source", mode="before")
     @classmethod
     def _coerce_legacy_data_source(cls, v: object) -> object:
-        # MT5 / TradingView 数据源已移除：历史配置一律迁移到 Binance。
-        if v in ("mt5", "tradingview"):
+        # MT5 / TradingView / A 股（东方财富 / AkShare / Tushare / YFinance）
+        # 数据源已移除：历史配置一律迁移到 Binance。
+        if v in (
+            "mt5",
+            "tradingview",
+            "ashare",
+            "akshare",
+            "tushare",
+            "yfinance",
+            "eastmoney",
+            "eastmoney_futures",
+            "adata",
+            "a_share",
+        ):
             return "binance"
-        if v in ("yfinance", "eastmoney", "adata", "a_share"):
-            return "ashare"
-        if v == "tushare":
-            return "tushare"
         return v
 
     @field_validator("decision_flow_default_zoom_pct", mode="before")
@@ -140,13 +139,6 @@ class GeneralSettings(BaseModel):
         if v is None:
             return 50
         return v
-
-
-class TushareSettings(BaseModel):
-    """Tushare Pro data source settings (persisted in ignored settings.json)."""
-    model_config = ConfigDict(extra="ignore")
-
-    token: str = ""
 
 
 class PushPlusSettings(BaseModel):
@@ -214,6 +206,17 @@ class AutoTradeSettings(BaseModel):
     #: 0 = 关闭。默认 0.3%，够躲开真正跑偏的行情，又不影响正常的几美元价差。
     max_price_deviation_pct: float = 0.3
 
+    # ── 开仓后的保护单（止损 / TP1 / TP2）────────────────────────────────
+    #: True = 开仓成交后立刻把止损与两个止盈价提交给交易所（条件单）。
+    #: 这样本程序崩了、容器重启、服务器断连都不影响止盈止损在交易所侧生效。
+    #: 现货没有交易所侧条件单，只有合约（U 本位永续）才真正挂得上去。
+    protect_after_entry: bool = True
+    #: TP1 平掉的比例（0~1），其余留给 TP2；止损永远保护全量仓位。
+    tp1_fraction: float = 0.5
+    #: 成交价与决策入场价相差超过这个 bps（万分之一）就告警。<=0 关闭。
+    #: 只告警不拒单 —— 单已成交，拒单只会让仓位裸奔。
+    max_slippage_bps: float = 30.0
+
 
 class DingTalkSettings(BaseModel):
     """钉钉群机器人通知设置（webhook + 加签 secret）。"""
@@ -228,6 +231,10 @@ class DingTalkSettings(BaseModel):
     at_all: bool = False
     #: True = 仅在出现下单机会时推送，不推其它状态
     notify_on_order_only: bool = True
+    #: True = 实盘成交（dry_run=False 且交易所已受理）后推送一条成交回报，
+    #: 内容含成交均价 / 数量 / 名义金额与保证金 / 下单时间 / 委托号 / 保护单挂单结果。
+    #: 试运行（dry_run=True）永远不会推送，与本开关无关。
+    notify_on_trade_filled: bool = True
     #: markdown / text
     msg_type: str = "markdown"
 
@@ -241,7 +248,6 @@ class Settings(BaseModel):
     prompt: PromptSettings = Field(default_factory=PromptSettings)
     validation: ValidationSettings = Field(default_factory=ValidationSettings)
     pushplus: PushPlusSettings = Field(default_factory=PushPlusSettings)
-    tushare: TushareSettings = Field(default_factory=TushareSettings)
     binance: BinanceSettings = Field(default_factory=BinanceSettings)
     okx: OKXSettings = Field(default_factory=OKXSettings)
     dingtalk: DingTalkSettings = Field(default_factory=DingTalkSettings)
@@ -259,12 +265,61 @@ def provider_api_key_configured(settings: Settings | None) -> bool:
 
 
 # ── Persistence ───────────────────────────────────────────────────────────────
+import hashlib
 import json
 import logging
 import os
+import shutil
+import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+#: 每个配置文件最近一次 ``load_settings()`` 读到的内容指纹（sha256）。
+#:
+#: 用途：``settings.json`` 是 GUI 与无头守护进程共用的唯一配置文件，而
+#: ``save_settings()`` 是**整份覆盖**（不是 diff）。若 A 进程读入快照后，
+#: B 进程改了盘上的文件，A 再保存就会把 B 的改动整体抹掉 —— 这正是
+#: 「GUI 里改的杠杆被服务端的旧值覆盖」的实际成因。
+#:
+#: 保存时用这个指纹做比对：磁盘现状与「我读进来的那一版」不一致就拒绝写，
+#: 让调用方提示用户刷新后重试，而不是静默覆盖。
+_LOADED_DIGESTS: dict[str, str] = {}
+
+
+def _path_key(path: Path) -> str:
+    """把路径归一成字典键（尽量 resolve，失败就用原样）。"""
+    try:
+        return str(path.resolve())
+    except OSError:  # pragma: no cover - 极端情况下 resolve 会抛
+        return str(path)
+
+
+def file_digest(path: Path | None = None) -> str:
+    """返回 *path* 当前内容的 sha256；文件不存在或读不到时返回空串。"""
+    from pa_agent.config.paths import SETTINGS_JSON_PATH
+
+    path = path or SETTINGS_JSON_PATH
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return ""
+    return hashlib.sha256(data).hexdigest()
+
+
+def loaded_digest(path: Path | None = None) -> str:
+    """返回该文件最近一次 ``load_settings()`` 看到的指纹（没加载过就是空串）。"""
+    from pa_agent.config.paths import SETTINGS_JSON_PATH
+
+    path = path or SETTINGS_JSON_PATH
+    return _LOADED_DIGESTS.get(_path_key(path), "")
+
+
+def _record_digest(path: Path) -> str:
+    """记录并返回磁盘当前指纹。"""
+    digest = file_digest(path)
+    _LOADED_DIGESTS[_path_key(path)] = digest
+    return digest
 
 
 def _drop_legacy_feishu_section(raw: dict) -> bool:
@@ -315,6 +370,90 @@ def _drop_stale_ark_fallbacks(raw: dict) -> bool:
     return True
 
 
+def _settings_backup_path(path: Path) -> Path:
+    """``settings.json`` 的上一版副本（固定名字，只留一份）。"""
+    return path.with_name(path.name + ".bak")
+
+
+def _quarantine_broken_settings(
+    path: Path, exc: BaseException, *, text: str = ""
+) -> "Settings | None":
+    """把读不动的 ``settings.json`` 改名留证，再放默认值。
+
+    原先这里只是 ``logger.warning(...); return Settings()``：一次断电把文件写成
+    半截 JSON，程序就静默跑在默认配置上 —— 凭据没了、``min_confidence`` 回到
+    默认值、``dry_run`` 回到 True，而磁盘上的原文件仍在那里，下一次任意
+    ``save_settings()`` 会把它**覆盖**掉，再也没法人工抢救。
+
+    现在的做法：
+      1. 原文件改名成 ``settings.json.corrupt-<时间戳>``（不删除、不覆盖）；
+      2. 若已有 ``.bak`` 且它是合法 JSON，就**用它恢复**并立即回写正本 ——
+         这是最理想的结果，用户几乎无感；
+      3. 恢复不了才退回默认值，但要打一条 error 级日志说清楚「凭据需要重填」。
+    """
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    broken = path.with_name(f"{path.name}.corrupt-{stamp}")
+    try:
+        path.replace(broken)
+        logger.error(
+            "settings.json 无法解析（%s），已改名保留为 %s —— "
+            "不会覆盖、不会删除，可人工修复后改回 settings.json。",
+            exc,
+            broken.name,
+        )
+    except OSError as move_exc:  # 文件被占用 / 目录只读：至少别把内容弄丢
+        logger.error(
+            "settings.json 无法解析（%s），且无法改名保留（%s）；"
+            "本次按默认配置运行，请尽快人工检查 %s。",
+            exc,
+            move_exc,
+            path,
+        )
+        return None
+
+    restored = _restore_from_backup(path)
+    if restored is not None:
+        logger.warning(
+            "已用备份 %s 恢复配置（含 API Key 与风控参数）。"
+            "损坏的原文件保留为 %s，可对照检查。",
+            _settings_backup_path(path).name,
+            broken.name,
+        )
+        return restored
+
+    logger.error(
+        "没有可用的 settings.json 备份，本次按【默认配置】运行："
+        "API Key / 交易所凭据 / 自动交易风控参数都回到默认值。"
+        "请把 %s 修好改回 settings.json，或重新在界面里填一遍。",
+        broken.name,
+    )
+    return None
+
+
+def _restore_from_backup(path: Path) -> "Settings | None":
+    """尝试用 ``settings.json.bak`` 恢复；成功则回写正本并返回结果。"""
+    bak = _settings_backup_path(path)
+    if not bak.exists():
+        return None
+    try:
+        raw = json.loads(bak.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("备份 %s 也不可用（%s），无法自动恢复。", bak.name, exc)
+        return None
+    try:
+        settings = Settings.model_validate(raw)
+    except Exception as exc:  # noqa: BLE001 —— 备份结构不符就当没有
+        logger.warning("备份 %s 的内容与当前配置结构不兼容（%s）。", bak.name, exc)
+        return None
+    try:
+        save_settings(settings, path)
+    except OSError as exc:
+        logger.warning(
+            "已从备份恢复内存配置，但回写 %s 失败（%s）；本次照常运行。", path, exc
+        )
+    return settings
+
+
 def load_settings(path: Path | None = None) -> "Settings":
     """Load settings from *path* (default: SETTINGS_JSON_PATH).
 
@@ -327,13 +466,20 @@ def load_settings(path: Path | None = None) -> "Settings":
     if not path.exists():
         defaults = Settings()
         _try_save_defaults(defaults, path)
+        _record_digest(path)
         return defaults
 
+    text = ""
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
+        raw = json.loads(text)
+        # 记住「我读到的是哪一版」：保存时用它判断盘上内容有没有被别人改过。
+        # 用文件的原始字节算（不是 text），否则 Windows 上 \r\n↔\n 的换行
+        # 转换会让指纹永远对不上。
+        _record_digest(path)
     except (json.JSONDecodeError, OSError) as exc:
-        logger.warning("settings.json unreadable (%s); using defaults", exc)
-        return Settings()
+        recovered = _quarantine_broken_settings(path, exc, text=text)
+        return recovered if recovered is not None else Settings()
 
     # Migrate legacy field names
     general = raw.get("general", {})
@@ -373,16 +519,100 @@ def load_settings(path: Path | None = None) -> "Settings":
     return settings
 
 
-def save_settings(settings: "Settings", path: Path | None = None) -> None:
-    """Persist settings to *path* (default: SETTINGS_JSON_PATH)."""
+def save_settings(
+    settings: "Settings",
+    path: Path | None = None,
+    *,
+    base_digest: str | None = None,
+    force: bool = False,
+) -> bool:
+    """Persist settings to *path* (default: SETTINGS_JSON_PATH).
+
+    Parameters
+    ----------
+    base_digest:
+        「我这次保存是建立在哪一版文件之上的」的 sha256。传 ``None``（默认）
+        表示不做并发校验 —— 用于首次初始化、迁移回写等「盘上内容本就是我
+        刚读到的」场景，以及所有现有调用点（保持向后兼容）。
+    force:
+        跳过所有并发校验，直接覆盖。仅供显式「以我为准」的场景使用。
+
+    Returns
+    -------
+    bool
+        ``True`` 表示已写入；``False`` 表示因并发冲突被**拒绝**（磁盘上的
+        文件已被别的进程改过），此时不改动磁盘内容，调用方应提示用户刷新。
+
+    Notes
+    -----
+    ``settings.json`` 由 GUI 与无头守护进程共用，而本函数是整份覆盖。
+    两进程同时运行时，谁后保存谁就抹掉对方的改动。``base_digest`` 提供
+    乐观锁语义：只在「磁盘内容仍是我读到的这一版」时才允许覆盖。
+    """
     from pa_agent.config.paths import SETTINGS_JSON_PATH
 
     path = path or SETTINGS_JSON_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    if not force and base_digest is not None:
+        current = file_digest(path)
+        # 文件不存在时 current 是空串：此时写入不会抹掉任何东西，放行。
+        if current and current != base_digest:
+            logger.warning(
+                "拒绝写入 %s：磁盘上的配置已被其他进程修改"
+                "（读入时 %s…，当前 %s…）；请刷新后重试本次修改。",
+                path,
+                base_digest[:8],
+                current[:8],
+            )
+            return False
+
     data = settings.model_dump()
 
+    # 覆盖前先把上一版留成 .bak：settings.json 是凭据与风控参数的唯一存放处，
+    # 一次写坏（断电 / 磁盘满 / 容器被 SIGKILL）就等于全部丢失。
+    # 只在原文件本身是合法 JSON 时才备份，避免把损坏内容当成「上一版」。
+    if path.exists():
+        try:
+            json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass  # 原文件已经坏了，别把坏内容顶掉更早的好备份
+        else:
+            bak = _settings_backup_path(path)
+            try:
+                shutil.copy2(path, bak)
+            except OSError as exc:
+                logger.warning("无法写入配置备份 %s（%s）；继续保存正本。", bak, exc)
+
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 写完之后我就是最新的那一版：刷新指纹，后续保存才算「基于当前内容」。
+    _record_digest(path)
+    return True
+
+
+class ConfigReloadError(RuntimeError):
+    """热重载 settings.json 失败（文件写坏 / 读不到 / 结构不符）。"""
+
+
+def reload_settings(path: Path | None = None) -> "Settings":
+    """重新从磁盘读取 *path*，用于运行中的守护进程热重载。
+
+    与 ``load_settings`` 的区别只有一点：**任何失败都抛异常**，而不是静默
+    回落默认值。运行中的进程用默认值覆盖掉用户的真实配置是灾难性的，
+    调用方（``DaemonRunner``）应该捕获异常并继续用内存里那份好的配置。
+    """
+    from pa_agent.config.paths import SETTINGS_JSON_PATH
+
+    path = path or SETTINGS_JSON_PATH
+    try:
+        text = path.read_text(encoding="utf-8")
+        json.loads(text)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigReloadError(f"{path} 无法读取或不是合法 JSON：{exc}") from exc
+    try:
+        return load_settings(path)
+    except Exception as exc:  # noqa: BLE001 - 结构不符也算重载失败
+        raise ConfigReloadError(f"{path} 内容无法解析为配置：{exc}") from exc
 
 
 def _try_save_defaults(defaults: "Settings", path: Path) -> None:

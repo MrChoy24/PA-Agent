@@ -21,19 +21,10 @@ dependencies = [
     "pydantic>=2.7",
     "cryptography>=42",
     "pywin32>=306; sys_platform == 'win32'",
-    "akshare>=1.14",
-    "baostock>=0.8",
-    "curl_cffi>=0.13",
-    "tushare>=1.4",
     "httpx[socks]>=0.27",
 ]
 
 [project.optional-dependencies]
-# 免费 A 股行情替补源（东财失效时的后备；纯 HTTP 无需任何依赖）
-# zzshare 为托管 API，pip 安装后即可免 Key 使用，可选
-ashare-fallback = [
-    "zzshare",
-]
 dev = [
     "pytest>=8",
     "pytest-qt>=4.4",

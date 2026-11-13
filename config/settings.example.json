@@ -51,6 +51,7 @@
     "at_mobiles": [],
     "at_all": false,
     "notify_on_order_only": true,
+    "notify_on_trade_filled": true,
     "msg_type": "markdown"
   },
   "binance": {
@@ -79,9 +80,6 @@
     "order_type": "MARKET",
     "margin_mode": "isolated",
     "max_price_deviation_pct": 0.3
-  },
-  "tushare": {
-    "token": ""
   },
   "ai_backups": []
 }

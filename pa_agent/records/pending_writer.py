@@ -10,11 +10,14 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from pa_agent.records.schema import AnalysisRecord, FollowupTurn
+from pa_agent.util import filelock
+from pa_agent.util.safepath import safe_exists
 from pa_agent.util.mask_secret import mask_secret
 
 
@@ -120,11 +123,10 @@ class PendingWriter:
         """
         path = self._pending_dir / f"{record_id}.followups.jsonl"
         line = json.dumps(turn.model_dump(), ensure_ascii=False)
-        try:
-            with path.open("a", encoding="utf-8") as fh:
-                fh.write(line + "\n")
-        except OSError as exc:
-            self._handle_disk_error(exc, path)
+        if not filelock.append_line(str(path), line):
+            self._handle_disk_error(
+                OSError(f"追加 followup 失败: {path}"), path
+            )
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -172,12 +174,29 @@ class PendingWriter:
         return _walk(data)
 
     def _write_json(self, path: Path, data: dict) -> None:
-        """Write *data* as pretty-printed JSON to *path*, handling errors."""
+        """Write *data* as pretty-printed JSON to *path*, handling errors.
+
+        先写同目录临时文件再 ``os.replace`` 原子替换：GUI 与守护进程同时运行时，
+        直接 ``write_text`` 会让另一个进程读到写了一半的 JSON
+        （分析记录里有完整的决策内容，读坏一条就丢一次分析）。
+        """
+        tmp: Path | None = None
         try:
             text = json.dumps(data, ensure_ascii=False, indent=2)
-            path.write_text(text, encoding="utf-8")
+            tmp = path.with_name(path.name + ".tmp")
+            with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(text)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
         except OSError as exc:
             self._handle_disk_error(exc, path)
+        finally:
+            if tmp is not None and safe_exists(tmp):
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
 
     def _handle_disk_error(self, exc: OSError, path: Path) -> None:
         """Log the error and optionally emit to the event bus."""

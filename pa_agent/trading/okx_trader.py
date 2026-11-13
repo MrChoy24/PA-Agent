@@ -25,7 +25,10 @@ sz 单位       基础币数量                   **张数**（= 基础币 / ctV
 ``sz`` 单位是最容易出错的地方：OKX SWAP 的 ``sz`` 是**张数**，每张面值由
 ``GET /api/v5/public/instruments?instType=SWAP`` 的 ``ctVal`` 给出
 （单位：基础币）。所以 ``0.05 BTC`` 在 ``ctVal=0.01`` 的合约上是 ``5`` 张。
-本模块统一用 :meth:`OKXTrader._contracts_for` 换算，向下取整、至少 1 张。
+本模块统一用 :meth:`OKXTrader._contracts_for` 换算，按 ``lotSz`` 步长向下取整
+（``lotSz`` 常为 ``0.01``，所以张数可以是小数，例如 ``0.5`` 张）；
+换算结果低于 ``minSz`` 时返回 0 由调用方拒单（**绝不向上兜底到 1 张**，
+那会让名义金额成倍放大）。
 
 Usage:
     trader = OKXTrader(api_key="...", api_secret="...", passphrase="...")
@@ -46,7 +49,9 @@ import hashlib
 import hmac
 import json
 import logging
+import time
 import urllib.parse
+from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from datetime import datetime, timezone
 from typing import Any
 
@@ -58,6 +63,10 @@ from pa_agent.trading.common import (
     MARGIN_ISOLATED,
     POSITION_LONG,
     POSITION_SHORT,
+    PROTECT_STOP_LOSS,
+    PROTECT_TAKE_PROFIT_1,
+    PROTECT_TAKE_PROFIT_2,
+    ProtectionOrder,
     TradeResult,
     clamp_leverage,
     floor_to_precision,
@@ -66,9 +75,11 @@ from pa_agent.trading.common import (
     normalize_margin_mode,
     normalize_market_type,
     normalize_position_side,
+    to_decimal,
     to_float,
     to_text,
 )
+from pa_agent.util import endpoints, throttle
 
 logger = logging.getLogger(__name__)
 
@@ -77,8 +88,25 @@ _HOSTS: tuple[str, ...] = (
     "https://aws.okx.com",
 )
 
+# ``_HOSTS`` 是历史常量：``aws.okx.com`` 在很多网络下 DNS 解析不了，
+# 直接当备用会导致主域名超时后必然再失败一轮。实际候选列表改由
+# ``pa_agent.util.endpoints.okx_hosts()`` 提供（默认只有 www.okx.com，
+# 可用环境变量 PA_AGENT_OKX_HOSTS 追加）。
+
+
+def _host_candidates(known: str) -> list[str]:
+    """当前可用的 OKX 主机，已确认过的 *known* 排在最前。"""
+    hosts = list(endpoints.okx_hosts())
+    if known:
+        return [known] + [h for h in hosts if h != known]
+    return hosts
+
 _BALANCE_PATH = "/api/v5/account/balance"
 _ORDER_PATH = "/api/v5/trade/order"
+_ALGO_ORDER_PATH = "/api/v5/trade/order-algo"
+_ALGO_PENDING_PATH = "/api/v5/trade/orders-algo-pending"
+_ORDER_DETAIL_PATH = "/api/v5/trade/order"
+_CANCEL_ALGO_PATH = "/api/v5/trade/cancel-algos"
 _OPEN_ORDERS_PATH = "/api/v5/trade/orders-pending"
 _CANCEL_PATH = "/api/v5/trade/cancel-order"
 _CLOSE_POSITION_PATH = "/api/v5/trade/close-position"
@@ -87,6 +115,13 @@ _TICKER_PATH = "/api/v5/market/ticker"
 _POSITIONS_PATH = "/api/v5/account/positions"
 _SET_LEVERAGE_PATH = "/api/v5/account/set-leverage"
 _ACCOUNT_CONFIG_PATH = "/api/v5/account/config"
+
+def _per_contract(rules: dict[str, Any]) -> float:
+    """每张合约代表的基础币数量（``ctVal × ctMult``），无效时返回 0。"""
+    ct_val = to_float(rules.get("ct_val"))
+    ct_mult = to_float(rules.get("ct_mult"), 1.0) or 1.0
+    return ct_val * ct_mult
+
 
 # 交易所默认最小名义金额（instrument 缺失时的保底值，单位 USDT）
 _DEFAULT_MIN_NOTIONAL = 5.0
@@ -293,18 +328,17 @@ class OKXTrader:
         # 下单/撤单只发一次：超时后状态未知，重试可能重复成交
         allow_failover = method == "GET"
         if allow_failover:
-            candidates = (
-                [self._host] + [h for h in _HOSTS if h != self._host]
-                if self._host
-                else list(_HOSTS)
-            )
+            candidates = _host_candidates(self._host)
         else:
-            candidates = [self._host or _HOSTS[0]]
+            candidates = [self._host or endpoints.OKX_DEFAULT_HOST]
 
         tried: list[str] = []
         for host in candidates:
             if not host:
                 continue
+            # 本地节流：同一个进程里所有 OKX 请求共用一个令牌桶，
+            # 把「一秒几十个请求」这类尖峰抹平，避免撞上交易所限频。
+            throttle.acquire("okx")
             url = f"{host}{request_path}"
             try:
                 resp = client.request(
@@ -344,7 +378,7 @@ class OKXTrader:
 
         detail = "; ".join(tried) or "unknown network error"
         logger.warning("OKX %s %s gave up: %s", method, path, detail)
-        return None, f"OKX 请求失败: {detail}"
+        return None, endpoints.unreachable_hint(tried)
 
     # ── 交易规则 ──────────────────────────────────────────────────────────────
 
@@ -372,6 +406,25 @@ class OKXTrader:
         if mkt == MARKET_FUTURES:
             return self._normalize_swap_inst_id(inst_id)
         return self._normalize_inst_id(inst_id)
+
+    def _pending_algo_orders(self, inst_id: str) -> list[dict[str, Any]]:
+        """挡在当前交易对上的在挂条件单（``orders-algo-pending``）。
+
+        查询失败一律返回空列表：宁可重复挂一次（后面的幂等判断兜底），
+        也不能因为一次查询抖动就让保护单完全挂不上。
+        """
+        payload, err = self._request(
+            "GET",
+            f"{_ALGO_PENDING_PATH}?ordType=conditional&instId={inst_id}",
+            signed=True,
+        )
+        if payload is None:
+            logger.warning(
+                "查询 %s 在挂条件单失败（%s），本次按「没有在挂单」处理", inst_id, err
+            )
+            return []
+        rows = payload.get("data") or []
+        return [r for r in rows if isinstance(r, dict)]
 
     def _instrument_rules(
         self, inst_id: str, inst_type: str | None = None
@@ -444,23 +497,85 @@ class OKXTrader:
                     return price
         return 0.0
 
-    def _contracts_for(self, base_qty: float, rules: dict[str, Any]) -> int:
-        """把基础币数量换算成 SWAP **张数**（向下取整，至少 1）。
+    def _fill_price_for(self, inst_id: str, ord_id: str, *, retries: int = 3) -> float:
+        """查一笔委托的真实成交均价 ``avgPx``；查不到返回 ``0.0``。
+
+        为什么要单独查：``POST /trade/order`` 的响应里**没有成交价**，
+        市价单尤其如此。早期版本直接把「限价」字段塞进 ``TradeResult.price``，
+        市价单就变成 ``0.0``，下游用它当保护单的几何基准就会全错
+        （止损按决策价校验，而不是真实成交价）。
+
+        市价单刚提交时可能还没成交完，``avgPx`` 会是 ``""``，
+        所以要短轮询几次；仍然拿不到就返回 0，由调用方决定怎么降级。
+        """
+        if not ord_id:
+            return 0.0
+        delay = 0.25
+        for attempt in range(max(1, retries)):
+            payload, err = self._request(
+                "GET",
+                _ORDER_DETAIL_PATH,
+                {"instId": inst_id, "ordId": ord_id},
+                signed=True,
+            )
+            if payload is None:
+                logger.debug("OKX 查询成交价失败（%s/%s）: %s", inst_id, ord_id, err)
+                return 0.0
+            for item in payload.get("data", ()) or ():
+                if not isinstance(item, dict):
+                    continue
+                avg = to_float(item.get("avgPx"))
+                if avg > 0:
+                    return avg
+                # 完全没成交就再等一下；部分成交也把 avgPx 先记下来
+                filled = to_float(item.get("accFillSz"))
+                if filled > 0:
+                    avg = to_float(item.get("avgPx"))
+                    if avg > 0:
+                        return avg
+            if attempt + 1 < retries:
+                time.sleep(delay)
+                delay *= 2
+        return 0.0
+
+    def _contracts_for(self, base_qty: float, rules: dict[str, Any]) -> float:
+        """把基础币数量换算成 SWAP **张数**，按 ``lotSz`` 步长向下取整。
 
         ``sz`` 的单位是张，每张代表 ``ctVal × ctMult`` 个基础币。
-        例：``ctVal=0.01``、目标 ``0.05 BTC`` → ``0.05 / 0.01 = 5`` 张。
+        例：``ctVal=0.1``、目标 ``0.05 ETH`` → ``0.5`` 张。
+
+        **张数不一定是整数**：OKX 合约的 ``lotSz`` 常见为 ``0.01``，
+        允许下 ``0.01`` 张（ETH-USDT-SWAP 即 0.001 ETH ≈ 1.9 USDT）。
+        早期版本把张数当 ``int`` 并向下取整，等于强制 1 张起步，
+        既会放大名义金额，也让 1 张仓位无法拆成两段止盈 —— 都是错的。
+
         ``ctVal`` 缺失（接口不可用）时无法安全换算，返回 ``0`` 让调用方拒单。
+        也**不做 "至少一张" 的兜底**：那会把小额订单悄悄放大成 1 张。
         """
-        ct_val = to_float(rules.get("ct_val"))
-        ct_mult = to_float(rules.get("ct_mult"), 1.0) or 1.0
-        per_contract = ct_val * ct_mult
+        per_contract = _per_contract(rules)
         if per_contract <= 0 or base_qty <= 0:
-            return 0
+            return 0.0
+        # 必须用 Decimal：0.3 / 0.1 在二进制浮点下是 2.9999999999999996，
+        # 直接除完取整会少算一份 —— 止损就会漏保护一部分仓位。
+        amount = to_decimal(base_qty)
+        unit = to_decimal(per_contract)
+        if amount is None or unit is None or unit <= 0:
+            return 0.0
         try:
-            count = int(base_qty / per_contract)
-        except (ZeroDivisionError, ValueError, OverflowError):
-            return 0
-        return max(count, 1)
+            raw = amount / unit
+        except (InvalidOperation, ZeroDivisionError, ValueError):
+            return 0.0
+        if raw <= 0:
+            return 0.0
+        # lotSz 是下单张数的步长；缺失时退回 1（等价于只允许整张）。
+        lot = to_decimal(rules.get("step"))
+        if lot is None or lot <= 0:
+            lot = Decimal(1)
+        try:
+            steps = (raw / lot).to_integral_value(rounding=ROUND_DOWN)
+            return float((steps * lot).normalize())
+        except (InvalidOperation, ValueError):
+            return 0.0
 
     # ── 账户 ──────────────────────────────────────────────────────────────────
 
@@ -742,8 +857,13 @@ class OKXTrader:
         position_side: str = POSITION_LONG,
         reduce_only: bool = False,
         margin_usdt: float | None = None,
+        trigger_price: float | None = None,
     ) -> TradeResult:
         """下现货或合约单，按 ``quantity`` / ``notional_usdt`` / ``margin_usdt`` 定量。
+
+        ``trigger_price`` 只对 ``order_type="trigger"`` 生效：这是 OKX 的
+        **计划委托**，价格触到 ``trigger_price`` 后才把单子送进撮合。
+        突破单用它来避免「分析耗时几分钟、价格已经越过入场价」的滑点。
 
         ``quantity`` 一律是**基础币数量**（如 0.05 BTC）；合约内部会按
         ``ctVal`` 换算成张数再放进 ``sz``（参见 :meth:`_contracts_for`）。
@@ -793,11 +913,20 @@ class OKXTrader:
             return fail("交易对（inst_id）为空")
         if side_l not in ("buy", "sell"):
             return fail(f"side 必须是 buy 或 sell，收到 {side!r}")
-        if type_l not in ("market", "limit"):
-            return fail(f"order_type 必须是 market 或 limit，收到 {order_type!r}")
+        if type_l not in ("market", "limit", "trigger"):
+            return fail(
+                f"order_type 必须是 market / limit / trigger，收到 {order_type!r}"
+            )
 
         price_f = to_float(price, 0.0)
-        if type_l == "limit" and price_f <= 0:
+        if type_l == "trigger":
+            # 计划委托的「价格」是触发价，不是委托价。
+            price_f = to_float(trigger_price, 0.0)
+            if price_f <= 0:
+                return fail(
+                    "计划委托（trigger）必须提供大于 0 的 trigger_price"
+                )
+        elif type_l == "limit" and price_f <= 0:
             return fail("限价单（limit）必须提供大于 0 的 price")
 
         rules = self._instrument_rules(inst, inst_type)
@@ -858,12 +987,24 @@ class OKXTrader:
                     f"张数 {contracts} 低于最小下单张数 minSz={format_decimal(min_qty)}"
                 )
             sz_value = format_decimal(contracts)
-            intended_qty = contracts * per_contract
+            # 用 Decimal 再乘一次：0.07 * 0.1 在二进制浮点下是
+            # 0.007000000000000001，显示出来很难看，也会写进日志与记录。
+            _intended = (to_decimal(contracts) or Decimal(0)) * (
+                to_decimal(per_contract) or Decimal(0)
+            )
+            intended_qty = float(_intended)
             order_price = floor_to_precision(price_f, tick) if price_f > 0 else 0.0
-            if type_l == "limit":
+            if type_l in ("limit", "trigger"):
                 if order_price <= 0:
                     return fail(f"价格 {format_decimal(price_f)} 取整后无效")
+            if type_l == "limit":
                 params["px"] = format_decimal(order_price)
+            elif type_l == "trigger":
+                # 计划委托：触到 triggerPx 后按市价（orderPx=-1）送进撮合。
+                # 用市价而不是限价，是因为触发瞬间价格已经在动，
+                # 挂限价极可能不成交（实测触发后等 52 秒才撮合上）。
+                params["triggerPx"] = format_decimal(order_price)
+                params["orderPx"] = "-1"
         elif type_l == "market" and qty_in <= 0 and target_notional > 0:
             # ── 现货市价单直接以计价币金额下单 ──
             if target_notional < min_notional:
@@ -899,6 +1040,8 @@ class OKXTrader:
             sz_value = format_decimal(qty)
             intended_qty = qty
 
+            if type_l == "trigger":
+                return fail("OKX 现货不支持计划委托（trigger），请改用合约")
             order_price = floor_to_precision(price_f, tick) if price_f > 0 else 0.0
             check_price = order_price if order_price > 0 else ref_price
             if check_price > 0 and intended_qty * check_price < min_notional:
@@ -935,7 +1078,10 @@ class OKXTrader:
                     lev_res.message,
                 )
 
-        payload, err = self._request("POST", _ORDER_PATH, body=params, signed=True)
+        # 计划委托走 order-algo 端点，返回的是 algoId 而不是 ordId。
+        is_trigger = type_l == "trigger"
+        endpoint = _ALGO_ORDER_PATH if is_trigger else _ORDER_PATH
+        payload, err = self._request("POST", endpoint, body=params, signed=True)
         if payload is None:
             return TradeResult(
                 ok=False,
@@ -957,7 +1103,7 @@ class OKXTrader:
 
         data = payload.get("data") or []
         first = data[0] if data and isinstance(data[0], dict) else {}
-        ord_id = str(first.get("ordId", "") or "")
+        ord_id = str(first.get("algoId" if is_trigger else "ordId", "") or "")
         sub_code = str(first.get("sCode", "") or "")
         if sub_code not in ("", "0"):
             sub_msg = str(first.get("sMsg", "") or "").strip()
@@ -979,6 +1125,44 @@ class OKXTrader:
                 margin_mode=mode if is_futures else MARGIN_ISOLATED,
             )
 
+        if is_trigger:
+            # 计划委托只是「挂上去等触发」，此刻还没有成交价、也没有持仓。
+            # 把它当成已成交会让上层立刻去挂保护单——挂到一个还不存在的仓位上。
+            return TradeResult(
+                ok=True,
+                venue=self.venue,
+                order_id=ord_id,
+                symbol=inst,
+                side=side_l,
+                order_type=type_l,
+                qty=intended_qty,
+                price=order_price,
+                message=(
+                    f"OKX 合约计划委托已挂 {side_l} {inst}"
+                    f"（触发价 {format_decimal(order_price)}，{lev}x {mode}，"
+                    f"algoId={ord_id or '—'}）"
+                ),
+                raw={
+                    "request": params,
+                    "pending": True,
+                    "algo_id": ord_id,
+                    "trigger_price": order_price,
+                },
+                market_type=mkt,
+                leverage=lev if is_futures else 1,
+                margin_usdt=margin_actual,
+                notional_usdt=notional_actual,
+                position_side=pos_side if is_futures else POSITION_LONG,
+                margin_mode=mode if is_futures else MARGIN_ISOLATED,
+            )
+
+        # 真实成交均价：市价单的 order_price 是 0，必须回查 avgPx。
+        # 拿不到（网络抖动/委托还没成交完）就退回限价或参考价，
+        # 至少不会把 0 传出去让保护单的几何校验失去基准。
+        fill_price = self._fill_price_for(inst, ord_id)
+        if fill_price <= 0:
+            fill_price = order_price if order_price > 0 else ref_price
+
         scope = "合约" if is_futures else "现货"
         return TradeResult(
             ok=True,
@@ -988,7 +1172,7 @@ class OKXTrader:
             side=side_l,
             order_type=type_l,
             qty=intended_qty,
-            price=order_price,
+            price=fill_price,
             message=(
                 f"OKX {scope} {type_l} {side_l} {inst} 已提交"
                 f"（数量 {format_decimal(intended_qty) or '—'}，"
@@ -1004,6 +1188,321 @@ class OKXTrader:
             position_side=pos_side if is_futures else POSITION_LONG,
             margin_mode=mode if is_futures else MARGIN_ISOLATED,
         )
+
+    def place_protections(
+        self,
+        inst_id: str,
+        *,
+        position_side: str = POSITION_LONG,
+        plans: list[tuple[str, float, float, str]],
+        market_type: str | None = None,
+        margin_mode: str | None = None,
+    ) -> list[ProtectionOrder]:
+        """开仓成功后立刻把止损 / TP1 / TP2 挂成交易所侧条件单。
+
+        OKX 的条件单走 ``POST /api/v5/trade/order-algo``（``ordType=conditional``）：
+        触发价 ``slTriggerPx`` / ``tpTriggerPx``，触发后按市价成交
+        （``slOrdPx=-1`` / ``tpOrdPx=-1``），并用 ``reduceOnly=True`` 确保只减仓。
+
+        **止损腿用 ``closeFraction="1"`` 而不是固定张数。** 原因是固定
+        ``sz`` 在分批止盈后会「多」出来：开 0.4 张、TP1 成交 0.2 张后
+        持仓只剩 0.2 张，而止损单仍写着 ``sz=0.4`` —— 触发时按当时持仓
+        一次全平，本来打算留着的后半段敞口提前没了（2026-11-14 在模拟盘
+        实测确认）。``closeFraction="1"`` 的语义是「平掉触发那一刻的全部
+        剩余持仓」，天然不受分批止盈影响。OKX 对它有四条硬约束，实测：
+        ``sz`` 与 ``closeFraction`` 不能同时给（50024）、必须配
+        ``reduceOnly=True``（51328）、只接受 ``1``（传 0.5 报 51000）、
+        仅限合约（51327）。
+
+        每条腿独立成败：某条挂了不影响其它腿，也**绝不抛异常** ——
+        调用方（:class:`~pa_agent.trading.auto_trader.AutoTrader`）拿到的是
+        一组 :class:`ProtectionOrder`，失败原因已经是可以直接给人看的中文。
+
+        ``plans`` 由 :func:`~pa_agent.trading.common.plan_protections` 生成。
+        """
+        mkt = normalize_market_type(
+            market_type if market_type is not None else self._market_type
+        )
+        is_futures = mkt == MARKET_FUTURES
+        mode = normalize_margin_mode(
+            self._margin_mode if margin_mode is None else margin_mode
+        )
+        pos_side = normalize_position_side(position_side)
+        inst = self._inst_id_for(inst_id, mkt)
+        td_mode = mode if is_futures else "cash"
+
+        # 现货没有交易所侧条件单：明确告错，不假装挂上
+        if not is_futures:
+            return [
+                ProtectionOrder(
+                    kind=kind,
+                    trigger_price=to_float(price, 0.0),
+                    qty=to_float(qty, 0.0),
+                    message="OKX 现货不支持交易所侧止损/止盈条件单，需使用合约",
+                )
+                for kind, price, qty, _problem in plans
+            ]
+
+        if not self._has_credentials():
+            return [
+                ProtectionOrder(
+                    kind=kind,
+                    trigger_price=to_float(price, 0.0),
+                    qty=to_float(qty, 0.0),
+                    message="未填写 OKX API Key/Secret/Passphrase，无法挂保护单",
+                )
+                for kind, price, qty, _problem in plans
+            ]
+        if not inst:
+            return [
+                ProtectionOrder(
+                    kind=kind,
+                    trigger_price=to_float(price, 0.0),
+                    qty=to_float(qty, 0.0),
+                    message="交易对（inst_id）为空",
+                )
+                for kind, price, qty, _problem in plans
+            ]
+
+        rules = self._instrument_rules(inst, "SWAP")
+        tick = to_float(rules.get("tick"), 0.0)
+        ct_val = to_float(rules.get("ct_val"), 0.0)
+        ct_mult = to_float(rules.get("ct_mult"), 1.0) or 1.0
+        per_contract = ct_val * ct_mult
+        # 平仓方向与开仓相反
+        close_side = "sell" if pos_side == POSITION_LONG else "buy"
+
+        # 止损腿用「全平」语义：closeFraction=1 平掉触发那一刻的全部剩余持仓。
+        # 固定 sz 在分批止盈后会「多」出来 —— 开 0.4 张、TP1 成交 0.2 张后
+        # 持仓只剩 0.2 张，止损单却仍写 sz=0.4（2026-11-14 模拟盘实测确认），
+        # 于是触发时一次全平，本来打算留着的后半段敞口提前没了。
+        # 约束（同样实测）：sz 与 closeFraction 互斥（50024）、只接受 1
+        # （0.5 报 51000）、必须配 reduceOnly（51328）、仅限合约（51327）、
+        # 双向持仓模式不可用（51329）→ 那种情况退回收敛到计划量的固定 sz。
+        sl_use_close_fraction = not self._is_long_short_mode()
+
+        # 幂等守卫：已经有条件单在场时，不要再叠一份。
+        # 止损用 closeFraction=1 时 OKX 会以 51088 拒掉第二条（天然防重），
+        # 但止盈腿是普通 sz 条件单，重复调用会**叠成双份**（实测：重启后
+        # 补挂一次，场上从 3 条变 5 条，TP1/TP2 各多一条 → 多平一倍仓位）。
+        # 所以这里先查一次在挂条件单：止损腿已有全平单就跳过，止盈腿
+        # 按 (方向, 触发价) 判断是否已经存在。
+        existing = self._pending_algo_orders(inst)
+        # 净持仓模式下 OKX 回显的 posSide 是字面量 ``"net"``，不是 "long"/"short"，
+        # 所以这里要把 ``""``、``"net"`` 和当前方向都认作同一条。
+        existing_sl_all = any(
+            str(a.get("closeFraction") or "") == "1"
+            and str(a.get("posSide") or "") in ("", "net", pos_side)
+            for a in existing
+        )
+        existing_tp_prices = {
+            to_float(a.get("tpTriggerPx"), 0.0)
+            for a in existing
+            if str(a.get("tpTriggerPx") or "").strip()
+        }
+
+        def _tp_already_exists(price: float) -> bool:
+            """触发价是否已有一条止盈单。
+
+            用容差而不是 ``==``：交易所回显的是**按 tick 取整后**的价格
+            （例如计划写 2010.005、tick=0.01 时回显 2010.0），直接比浮点数
+            会漏判，于是又叠一条。容差取 tick 的一半，够覆盖取整误差。
+            """
+            tol = tick / 2 if tick > 0 else 1e-9
+            return any(abs(price - p) <= tol for p in existing_tp_prices)
+
+        # 张数可以是小数（lotSz 常为 0.01），所以 TP1/TP2 各挂半仓是合法的，
+        # 不需要再做「只够 1 张就合并」的降级。只有当某一段换算后真的
+        # 低于 minSz（极端小仓 / 整张步长的老合约）时才合并。
+        min_sz = to_float(rules.get("min_qty"), 0.0)
+        tp_leg_contracts: dict[str, float] = {}
+        tp_total_qty = 0.0
+        for _kind, _price, _qty, _problem in plans:
+            if _kind in (PROTECT_TAKE_PROFIT_1, PROTECT_TAKE_PROFIT_2):
+                leg = to_float(_qty, 0.0)
+                tp_total_qty += leg
+                tp_leg_contracts[_kind] = self._contracts_for(leg, rules)
+
+        def _too_small(contracts: float) -> bool:
+            return contracts <= 0 or (min_sz > 0 and contracts < min_sz)
+
+        # 任何一段不达标 → 整个止盈合并成一条，挂在 TP1 的价位上（先落袋为安），
+        # 数量为两段之和。合并后仍不达标的话，后面按 minSz 逐条报错。
+        weak_legs = [k for k, c in tp_leg_contracts.items() if _too_small(c)]
+        merge_tp = bool(weak_legs) and len(tp_leg_contracts) > 1
+        merge_into = PROTECT_TAKE_PROFIT_1 if merge_tp else ""
+
+        out: list[ProtectionOrder] = []
+        for kind, price, qty, problem in plans:
+            trigger = to_float(price, 0.0)
+            leg_qty = to_float(qty, 0.0)
+
+            if merge_tp and kind == PROTECT_TAKE_PROFIT_2:
+                out.append(
+                    ProtectionOrder(
+                        kind=kind,
+                        trigger_price=round(trigger, 8),
+                        qty=round(leg_qty, 8),
+                        message=(
+                            f"止盈两段里有张数低于最小下单张数 "
+                            f"{format_decimal(min_sz)}，已合并到 TP1 一次平掉"
+                        ),
+                    )
+                )
+                continue
+            if merge_tp and kind == merge_into:
+                # 合并后由 TP1 一次平掉两段的量
+                leg_qty = tp_total_qty
+
+            if problem:
+                out.append(
+                    ProtectionOrder(
+                        kind=kind,
+                        trigger_price=round(trigger, 8),
+                        qty=round(leg_qty, 8),
+                        message=problem,
+                    )
+                )
+                continue
+            if per_contract <= 0:
+                out.append(
+                    ProtectionOrder(
+                        kind=kind,
+                        trigger_price=round(trigger, 8),
+                        qty=round(leg_qty, 8),
+                        message=f"无法获取 {inst} 合约面值 ctVal，拒绝挂单",
+                    )
+                )
+                continue
+
+            # 止损腿用「全平」语义：closeFraction=1 平掉触发那一刻的全部剩余
+            # 持仓，因此不需要 sz、也不会因为换算张数为 0 而挂不上。
+            use_close_fraction = kind == PROTECT_STOP_LOSS and sl_use_close_fraction
+
+            # 幂等：止损已经有一条全平单、或止盈在这个价位已经挂过，就跳过，
+            # 免得重启后重复补挂把止盈叠成双份（实测会多平一倍仓位）。
+            if use_close_fraction and existing_sl_all:
+                out.append(
+                    ProtectionOrder(
+                        kind=kind,
+                        ok=True,
+                        trigger_price=round(trigger, 8),
+                        qty=round(leg_qty, 8),
+                        message="已有全平止损条件单在场，本次不重复挂",
+                    )
+                )
+                continue
+            if kind != PROTECT_STOP_LOSS and _tp_already_exists(trigger):
+                out.append(
+                    ProtectionOrder(
+                        kind=kind,
+                        ok=True,
+                        trigger_price=round(trigger, 8),
+                        qty=round(leg_qty, 8),
+                        message="该价位已有止盈条件单在场，本次不重复挂",
+                    )
+                )
+                continue
+
+            contracts = self._contracts_for(leg_qty, rules)
+            if contracts <= 0 and not use_close_fraction:
+                out.append(
+                    ProtectionOrder(
+                        kind=kind,
+                        trigger_price=round(trigger, 8),
+                        qty=round(leg_qty, 8),
+                        message=(
+                            f"数量 {format_decimal(leg_qty)} 换算成张数为 0，"
+                            f"无法挂保护单"
+                        ),
+                    )
+                )
+                continue
+
+            trigger_px = floor_to_precision(trigger, tick) if tick > 0 else trigger
+            if trigger_px <= 0:
+                out.append(
+                    ProtectionOrder(
+                        kind=kind,
+                        trigger_price=round(trigger, 8),
+                        qty=round(leg_qty, 8),
+                        message=f"触发价 {format_decimal(trigger)} 取整后无效",
+                    )
+                )
+                continue
+
+            params: dict[str, Any] = {
+                "instId": inst,
+                "tdMode": td_mode,
+                "side": close_side,
+                "ordType": "conditional",
+                "reduceOnly": True,
+            }
+            # 止损腿走「全平」语义，TP 腿仍按计划量分批挂。
+            # 约束：sz 与 closeFraction 互斥（50024）、closeFraction 只接受 1
+            # （0.5 报 51000）、必须配 reduceOnly（51328）、仅限合约（51327）。
+            if use_close_fraction:
+                params["closeFraction"] = "1"
+            else:
+                params["sz"] = format_decimal(contracts)
+            if self._is_long_short_mode():
+                # 双向持仓模式必须指明是哪一边的仓位，否则报 51010
+                params["posSide"] = pos_side
+            if kind == PROTECT_STOP_LOSS:
+                params["slTriggerPx"] = format_decimal(trigger_px)
+                params["slOrdPx"] = "-1"
+            else:
+                params["tpTriggerPx"] = format_decimal(trigger_px)
+                params["tpOrdPx"] = "-1"
+
+            # 全平止损不带数量（contracts 可能是 0），回报时退回计划量
+            reported_qty = round(leg_qty, 8) if use_close_fraction else round(
+                contracts * per_contract, 8
+            )
+
+            payload, err = self._request(
+                "POST", _ALGO_ORDER_PATH, body=params, signed=True
+            )
+            if payload is None:
+                out.append(
+                    ProtectionOrder(
+                        kind=kind,
+                        trigger_price=round(trigger_px, 8),
+                        qty=reported_qty,
+                        message=err or "OKX 保护单提交失败（状态未知，请到交易所核对）",
+                        raw={"request": params},
+                    )
+                )
+                continue
+
+            data = payload.get("data") or []
+            first = data[0] if data and isinstance(data[0], dict) else {}
+            algo_id = str(first.get("algoId", "") or "")
+            sub_code = str(first.get("sCode", "") or "")
+            if sub_code not in ("", "0"):
+                sub_msg = str(first.get("sMsg", "") or "").strip()
+                out.append(
+                    ProtectionOrder(
+                        kind=kind,
+                        trigger_price=round(trigger_px, 8),
+                        qty=reported_qty,
+                        message=f"OKX 保护单被拒 {sub_code}: {sub_msg}".strip(),
+                        raw=dict(payload),
+                    )
+                )
+                continue
+
+            out.append(
+                ProtectionOrder(
+                    kind=kind,
+                    ok=True,
+                    trigger_price=round(trigger_px, 8),
+                    qty=reported_qty,
+                    order_id=algo_id,
+                    raw=dict(payload),
+                )
+            )
+        return out
 
     def close_position(
         self, inst_id: str, position_side: str = POSITION_LONG

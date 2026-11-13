@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from pa_agent.config.settings import Settings, save_settings
+from pa_agent.config.settings import Settings, loaded_digest, save_settings
 from pa_agent.gui.backup_providers_panel import BackupProvidersPanel
 from pa_agent.config.paths import SETTINGS_JSON_PATH
 from pa_agent.ai.qclaw_connector import (
@@ -185,7 +185,16 @@ class AIModelSettingsDialog(QDialog):
         self._apply_glm_backup(p)
         self._settings.ai_backups = self._backup_panel.collect_entries()
 
-        save_settings(self._settings, SETTINGS_JSON_PATH)
+        if not save_settings(
+            self._settings, SETTINGS_JSON_PATH, base_digest=loaded_digest()
+        ):
+            QMessageBox.warning(
+                self,
+                "配置已被外部修改",
+                "config/settings.json 在对话框打开期间被其他程序修改过，"
+                "本次改动未写入磁盘。\n\n请关闭对话框重新打开后再改一次。",
+            )
+            return
         self.accept()
 
     def _apply_glm_backup(self, p: Any) -> None:

@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
 )
 
 from pa_agent.config.paths import SETTINGS_JSON_PATH
-from pa_agent.config.settings import Settings, save_settings
+from pa_agent.config.settings import Settings, loaded_digest, save_settings
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +142,16 @@ class DingTalkSettingsDialog(QDialog):
         )
         push_form.addRow("推送范围:", self._order_only_check)
 
+        self._trade_filled_check = QCheckBox("实盘成交后推送成交明细")
+        self._trade_filled_check.setToolTip(
+            "勾选后，真实成交（试运行不算）会额外推送一条回报，"
+            "含交易所、交易对、方向、开仓价（成交均价）、数量、"
+            "下单金额（名义金额与占用保证金）、下单时间、委托号，"
+            "以及止损 / TP1 / TP2 有没有真的挂到交易所侧。\n"
+            "试运行（dry_run=true）永远不会推送这条。"
+        )
+        push_form.addRow("成交回报:", self._trade_filled_check)
+
         root.addWidget(push_group)
 
         # ── 测试按钮 ────────────────────────────────────────────────────────────
@@ -190,6 +200,9 @@ class DingTalkSettingsDialog(QDialog):
         self._order_only_check.setChecked(
             bool(getattr(cfg, "notify_on_order_only", True))
         )
+        self._trade_filled_check.setChecked(
+            bool(getattr(cfg, "notify_on_trade_filled", True))
+        )
         msg_type = str(getattr(cfg, "msg_type", "markdown") or "markdown")
         idx = self._msg_type_combo.findData(msg_type)
         self._msg_type_combo.setCurrentIndex(idx if idx >= 0 else 0)
@@ -209,6 +222,7 @@ class DingTalkSettingsDialog(QDialog):
         cfg.at_all = self._at_all_check.isChecked()
         cfg.at_mobiles = self._split_mobiles(self._at_mobiles_edit.text())
         cfg.notify_on_order_only = self._order_only_check.isChecked()
+        cfg.notify_on_trade_filled = self._trade_filled_check.isChecked()
         cfg.msg_type = str(self._msg_type_combo.currentData() or "markdown")
 
     def _on_save(self) -> None:
@@ -222,7 +236,16 @@ class DingTalkSettingsDialog(QDialog):
             )
             return
         try:
-            save_settings(self._settings, SETTINGS_JSON_PATH)
+            if not save_settings(
+                self._settings, SETTINGS_JSON_PATH, base_digest=loaded_digest()
+            ):
+                QMessageBox.warning(
+                    self,
+                    "配置已被外部修改",
+                    "config/settings.json 在对话框打开期间被其他程序修改过，"
+                    "本次改动未写入磁盘。\n\n请关闭对话框重新打开后再改一次。",
+                )
+                return
             self.accept()
         except Exception as exc:
             QMessageBox.critical(

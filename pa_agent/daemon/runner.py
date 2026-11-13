@@ -39,6 +39,10 @@ from pa_agent.data.snapshot import INDICATOR_WARMUP_BARS, build_analysis_frame
 logger = logging.getLogger(__name__)
 
 #: How long to wait before retrying after a transient data-source failure.
+#: 待触发补偿的检查间隔。它不是实时任务，20 秒一次的 tick 不必每轮都查 ——
+#: 每轮都读日志文件 + 打交易所接口，既浪费一次 TLS 握手，也把实盘告警刷满日志。
+_RESUME_CHECK_INTERVAL_S = 120.0
+
 _ERROR_BACKOFF_S = 15.0
 #: Cap for the exponential backoff after repeated failures.
 _MAX_BACKOFF_S = 300.0
@@ -77,6 +81,13 @@ class DaemonRunner:
         self._rounds = 0
         self._analyses = 0
         self._last_outcome: AnalysisOutcome | None = None
+        #: 复用的 AutoTrader 与它的配置指纹（配置变了才重建）。
+        self._auto_trader_cached: Any = None
+        self._auto_trader_key: Any = None
+        #: 上次做「待触发补偿」检查的时间（monotonic 秒）。
+        self._resume_checked_at: float = 0.0
+        #: 上次看到的 settings.json 修改时间（热重载用）。
+        self._settings_mtime: float = self._current_mtime()
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
@@ -186,6 +197,10 @@ class DaemonRunner:
             pending_writer=pending_writer,
             exp_reader=exp_reader,
             settings=settings,
+            # 守护进程不回写 settings.json：它是 GUI 与 daemon 共用的唯一配置源，
+            # 而 daemon 手里是启动快照 —— 降级时回写会把用户在 GUI 里刚改的
+            # 杠杆/保证金/风控参数整份抹掉。只读模式下降级仍生效，只是不落盘。
+            config_writable=False,
         )
         logger.info("分析引擎就绪（provider=%s）", settings.provider.model)
 
@@ -196,6 +211,76 @@ class DaemonRunner:
             except Exception as exc:  # noqa: BLE001
                 logger.debug("断开数据源时出错（忽略）：%s", exc)
             self._source = None
+
+    # ── settings hot reload ──────────────────────────────────────────────────
+
+    def _current_mtime(self) -> float:
+        """settings.json 的修改时间；读不到时返回 0.0。"""
+        try:
+            return float(self._cfg.settings_path.stat().st_mtime)
+        except (OSError, AttributeError, ValueError):
+            return 0.0
+
+    def _reload_if_settings_changed(self) -> bool:
+        """配置文件被外部改过就重新加载 + 重建分析引擎。
+
+        用户在 GUI / 编辑器里改完参数（杠杆、保证金、模型、风控阈值），
+        跑在服务器上的 daemon 不该等到重启才生效 —— 但也不能真的每轮都
+        重新读盘解析一遍。所以只在 mtime 变化时才真正动作。
+
+        Returns ``True`` 表示这次真的重载了。
+        """
+        mtime = self._current_mtime()
+        if mtime <= 0 or mtime == self._settings_mtime:
+            return False
+
+        from pa_agent.config.settings import ConfigReloadError, reload_settings
+
+        try:
+            # reload_settings 会重跑 load_settings，并把 .env 覆盖重新套一遍，
+            # 保证热重载后的值与「重启一次」完全等价。
+            new_settings = reload_settings(self._cfg.settings_path)
+        except ConfigReloadError as exc:
+            # 用户可能正写到一半（编辑器保存瞬间、或者手滑写坏 JSON）。
+            # 不退出、不重试狂刷：记一条日志，下一轮 mtime 还会变，自然会再来。
+            logger.warning("配置文件已改动但读取失败，继续使用当前配置：%s", exc)
+            self._settings_mtime = mtime
+            return False
+        except Exception as exc:  # noqa: BLE001 - 热重载绝不能让进程挂掉
+            logger.warning("配置热重载失败，继续使用当前配置：%s", exc)
+            self._settings_mtime = mtime
+            return False
+
+        old = self._cfg.settings
+        self._cfg.settings = new_settings
+        self._settings_mtime = mtime
+
+        # .env 里的自动交易覆盖要重新套一遍，否则改 .env 不生效。
+        from pa_agent.daemon.config import apply_all_env_overrides
+
+        apply_all_env_overrides(new_settings)
+
+        logger.info(
+            "配置已热重载（%s）：模型 %s → %s，杠杆 %s → %s，单笔上限 %s → %s USDT",
+            self._cfg.settings_path.name,
+            old.provider.model,
+            new_settings.provider.model,
+            getattr(old.auto_trade, "leverage", "—"),
+            getattr(new_settings.auto_trade, "leverage", "—"),
+            getattr(old.auto_trade, "max_notional_usdt", "—"),
+            getattr(new_settings.auto_trade, "max_notional_usdt", "—"),
+        )
+
+        # 分析引擎持有 settings 的引用（provider / prompt / validation 都在里面），
+        # 换了一份新对象就必须重建，否则新值不会生效。
+        try:
+            self._build_orchestrator()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("配置已重新加载，但重建分析引擎失败：%s", exc, exc_info=True)
+        # AutoTrader 的配置指纹也会变，清掉缓存让它按新配置重建。
+        self._auto_trader_cached = None
+        self._auto_trader_key = None
+        return True
 
     # ── main loop ────────────────────────────────────────────────────────────
 
@@ -256,6 +341,16 @@ class DaemonRunner:
 
         cfg = self._cfg
         self._rounds += 1
+
+        # 配置热重载：用户在 GUI / 编辑器里改完 settings.json，服务器上的
+        # daemon 不必等重启。只在 mtime 变化时才真正重新解析，正常轮询无开销。
+        self._reload_if_settings_changed()
+        cfg = self._cfg
+
+        # 突破单挂的是计划委托，成交发生在交易所侧、与本次分析无关。
+        # 每轮先看一眼「上一条待触发的计划委托有没有成交」，成交了就补挂
+        # 止损/TP1/TP2 —— 这是唯一能保证「分析逻辑完全没跑也能补上保护单」的点。
+        self._resume_pending_trigger()
 
         needed = cfg.bar_count + INDICATOR_WARMUP_BARS + 5
         bars: list[KlineBar] = list(self._source.latest_snapshot(needed))
@@ -596,6 +691,15 @@ class DaemonRunner:
                 "max_price_deviation_pct": float(
                     getattr(cfg, "max_price_deviation_pct", 0.3) or 0.0
                 ),
+                # 开仓后立刻挂保护单（止损 / TP1 / TP2）到交易所侧
+                "protect_after_entry": bool(
+                    getattr(cfg, "protect_after_entry", True)
+                ),
+                "tp1_fraction": float(getattr(cfg, "tp1_fraction", 0.5) or 0.5),
+                # 成交价 vs 决策入场价的偏差告警（bps，0 关闭）
+                "max_slippage_bps": float(
+                    getattr(cfg, "max_slippage_bps", 30.0) or 0.0
+                ),
             }
         venue = str(getattr(cfg, "venue", "") or "binance").lower() or "binance"
         opts["venue"] = venue
@@ -608,15 +712,64 @@ class DaemonRunner:
             opts["testnet"] = bool(getattr(creds, "testnet", False))
         return opts
 
+    def _auto_trader(self):
+        """复用一个 AutoTrader（内部再复用交易所连接），配置变了才重建。
+
+        每轮 tick 都新建实例的话，光 ``__init__`` 里的实盘告警就能把日志刷满；
+        而且每次都新建 HTTP 连接，白白多一轮 TLS 握手。``_auto_trade_options()``
+        的返回值正好可以当缓存键（它是个 dict，转成排序后的元组比较）。
+        """
+        from pa_agent.trading.auto_trader import AutoTrader
+
+        opts = self._auto_trade_options()
+        if not opts.get("enabled"):
+            self._auto_trader_cached = None
+            self._auto_trader_key = None
+            return None
+        venue = str(opts.get("venue") or "binance")
+        key = (venue, tuple(sorted((k, repr(v)) for k, v in opts.items())))
+        cached = getattr(self, "_auto_trader_cached", None)
+        if cached is not None and getattr(self, "_auto_trader_key", None) == key:
+            return cached
+        trader = AutoTrader(opts, venue=venue)
+        self._auto_trader_cached = trader
+        self._auto_trader_key = key
+        return trader
+
+    def _resume_pending_trigger(self) -> None:
+        """若上一条突破单计划委托已成交，补挂保护单（绝不抛异常）。
+
+        每 ``_RESUME_CHECK_INTERVAL_S`` 秒才真正查一次：待触发补偿不是实时任务，
+        20 秒一次的 tick 不需要每轮都读日志文件 + 打交易所接口。
+        """
+        if not self._auto_trade_options().get("enabled"):
+            return
+        now = time.monotonic()
+        if now - self._resume_checked_at < _RESUME_CHECK_INTERVAL_S:
+            return
+        self._resume_checked_at = now
+        try:
+            trader = self._auto_trader()
+            if trader is None:
+                return
+            # 先廉价判断有没有待办，避免白打一次交易所接口
+            if trader._last_pending_trigger() is None:
+                return
+            handled, message = trader.resume_pending_trigger()
+            if handled:
+                logger.info("自动交易：突破单触发后已补挂保护单（%s）", message)
+                self._notify_trigger_resumed(trader)
+        except Exception as exc:  # noqa: BLE001 - 补偿失败不影响主循环
+            logger.debug("突破单补挂检查失败（忽略）：%s", exc)
+
     def _maybe_auto_trade(self, inner: dict) -> str:
         opts = self._auto_trade_options()
         if not opts.get("enabled"):
             return ""
         try:
-            from pa_agent.trading.auto_trader import AutoTrader
-
-            venue = str(opts.pop("venue", "binance") or "binance")
-            trader = AutoTrader(opts, venue=venue)
+            trader = self._auto_trader()
+            if trader is None:
+                return ""
             last_price = None
             close = inner.get("entry_price")
             try:
@@ -636,10 +789,47 @@ class DaemonRunner:
                 outcome.dry_run,
                 outcome.reason,
             )
+            self._notify_trade_outcome(outcome)
             return f"{outcome.reason}" + ("（试运行）" if outcome.dry_run and outcome.executed else "")
         except Exception as exc:  # noqa: BLE001 - trading must never kill the loop
             logger.warning("自动交易异常（不影响主流程）：%s", exc)
             return f"error: {exc}"
+
+    # ── 实盘成交回报（钉钉） ──────────────────────────────────────────────────
+
+    def _notify_trade_outcome(self, outcome) -> None:
+        '''真实成交后把开仓价 / 数量 / 金额 / 保护单结果推到钉钉（绝不抛异常）。
+
+        只推 executed=True 且 dry_run=False 的结果；试运行永远不推。
+        '''
+        try:
+            from pa_agent.notify.trade_report import notify_trade_outcome
+
+            notify_trade_outcome(
+                outcome,
+                settings=self._cfg.settings,
+                venue=str(self._auto_trade_options().get('venue') or ''),
+                symbol=self._cfg.symbol,
+                timeframe=self._cfg.timeframe,
+            )
+        except Exception as exc:  # noqa: BLE001 - 通知失败不影响主循环
+            logger.warning('实盘成交回报推送异常（忽略）：%s', exc)
+
+    def _notify_trigger_resumed(self, trader) -> None:
+        '''突破单触发成交、补挂保护单后推一条成交回报（绝不抛异常）。'''
+        try:
+            report = getattr(trader, 'last_resume_report', None)
+            if not report:
+                return
+            from pa_agent.notify.trade_report import notify_trigger_resumed
+
+            notify_trigger_resumed(
+                report,
+                settings=self._cfg.settings,
+                venue=str(self._auto_trade_options().get('venue') or ''),
+            )
+        except Exception as exc:  # noqa: BLE001 - 通知失败不影响主循环
+            logger.warning('突破单成交回报推送异常（忽略）：%s', exc)
 
     # ── health ───────────────────────────────────────────────────────────────
 

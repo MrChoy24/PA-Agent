@@ -108,12 +108,6 @@ def reference_now_ms(
     return local_ms
 
 
-def _looks_like_ashare_symbol(symbol: str | None) -> bool:
-    from pa_agent.data.market_defaults import normalize_ashare_tv_code
-
-    code = normalize_ashare_tv_code(symbol or "")
-    return len(code) == 6 and code.isdigit()
-
 def is_bar_still_forming(
     bar: KlineBar,
     timeframe: str,
@@ -121,25 +115,23 @@ def is_bar_still_forming(
     now_ms: int | None = None,
     symbol: str | None = None,
 ) -> bool:
-    """True when the newest bar period has not ended (wall-clock + A-share daily session)."""
+    """True when the newest bar period has not ended (wall-clock check).
+
+    .. note::
+       ``symbol`` 参数保留以兼容既有调用方，但已不再参与判断 —— 原先用于
+       A 股交易日休市判定的分支随 A 股数据源一并移除，加密货币 24×7 交易
+       不需要它。
+    """
     if bar.closed:
         return False
     if now_ms is None:
         now_ms = int(time.time() * 1000)
-    tf = str(timeframe or "").strip().lower()
-    if tf == "1d" and _looks_like_ashare_symbol(symbol):
-        try:
-            from pa_agent.data.akshare_source import _ashare_session_open
-
-            if not _ashare_session_open():
-                return False
-        except ImportError:
-            pass
     duration_s = timeframe_to_seconds(timeframe)
     if duration_s is None:
         return True
     from pa_agent.data.datetime_ts import ts_open_to_ms
 
+    tf = str(timeframe or "").strip().lower()
     ts_open = int(ts_open_to_ms(bar.ts_open))
     close_ms = ts_open + duration_s * 1000
 

@@ -27,8 +27,17 @@ class AppContext:
     ledger: Any = None            # SessionTokenLedger
 
     @classmethod
-    def bootstrap(cls) -> "AppContext":
-        """Wire all real components and return a fully initialised AppContext."""
+    def bootstrap(cls, *, role: str = "gui") -> "AppContext":
+        """Wire all real components and return a fully initialised AppContext.
+
+        Parameters
+        ----------
+        role:
+            ``"gui"``（默认）或 ``"daemon"``。守护进程以配置只读身份运行：
+            ``settings.json`` 由 GUI 与 daemon 共用，daemon 只读取、不回写，
+            否则会用启动快照整份覆盖用户在 GUI 里刚改的参数。
+        """
+        readonly = role == "daemon"
         from pa_agent.config.paths import (
             SETTINGS_JSON_PATH,
             RECORDS_PENDING_DIR,
@@ -55,10 +64,14 @@ class AppContext:
         from pa_agent.ai.trae_connector import sync_trae_cn_provider_on_load
         from pa_agent.ai.qoder_connector import sync_qoder_cn_provider_on_load
 
-        sync_qclaw_agent_provider_on_load(settings, save_path=SETTINGS_JSON_PATH)
-        sync_workbuddy_provider_on_load(settings, save_path=SETTINGS_JSON_PATH)
-        sync_trae_cn_provider_on_load(settings, save_path=SETTINGS_JSON_PATH)
-        sync_qoder_cn_provider_on_load(settings, save_path=SETTINGS_JSON_PATH)
+        # 连接器在加载时会把探测到的 token 回写 settings.json。daemon 必须跳过：
+        # 它拿的是启动快照，回写就等于覆盖 GUI 侧的配置。（save_path=None 时
+        # 各 connector 内部只改内存，不落盘。）
+        _save_path = None if readonly else SETTINGS_JSON_PATH
+        sync_qclaw_agent_provider_on_load(settings, save_path=_save_path)
+        sync_workbuddy_provider_on_load(settings, save_path=_save_path)
+        sync_trae_cn_provider_on_load(settings, save_path=_save_path)
+        sync_qoder_cn_provider_on_load(settings, save_path=_save_path)
 
         # ── Logging (with API key masking) ────────────────────────────────────
         configure_logging(api_key=settings.provider.api_key)
@@ -69,9 +82,6 @@ class AppContext:
         event_bus = EventBus()
 
         # ── Data layer ────────────────────────────────────────────────────────
-        from pa_agent.data.kline_adjust import apply_kline_adjust_from_settings
-
-        apply_kline_adjust_from_settings(settings)
         ds_kind = normalize_data_source_kind(
             getattr(settings.general, "last_data_source", "binance")
         )

@@ -79,6 +79,59 @@ def extra_fallbacks(settings: Any) -> list[Any]:
 #: 环境变量名：在 ``.env`` 里直接写备用池，免去改 settings.json / 重开容器配置。
 FALLBACK_SPEC_ENV = "PA_AGENT_FALLBACKS"
 
+#: 可接受的等义变量名。daemon 的其它键几乎都是 ``PA_DAEMON_*`` 前缀，只有这一项
+#: 是 ``PA_AGENT_*``，非常容易写错；写错后既不报错也不生效，是最难自查的一类问题。
+#: 所以两种前缀都认，并在检测到「像但不对」的名字时给出提示。
+FALLBACK_SPEC_ENV_ALIASES = ("PA_DAEMON_FALLBACKS",)
+
+#: 近似拼写（缺复数、大小写变体等）：命中就提示，避免静默失效。
+_FALLBACK_SPEC_LOOKALIKES = (
+    "PA_DAEMON_FALLBACK",
+    "PA_AGENT_FALLBACK",
+    "PA_AGENT_FALLBACK_POOL",
+    "PA_DAEMON_FALLBACK_POOL",
+    "FALLBACKS",
+)
+
+
+def read_fallback_spec() -> tuple[str, str]:
+    """读备用池环境变量，返回 ``(原始值, 命中的变量名)``；都没设返回 ``("", "")``。
+
+    别名与主名同时存在时以主名为准，并在日志里提示另一个被忽略。
+    """
+    import logging
+    import os
+
+    log = logging.getLogger(__name__)
+    for name in (FALLBACK_SPEC_ENV, *FALLBACK_SPEC_ENV_ALIASES):
+        raw = str(os.environ.get(name, "") or "").strip()
+        if raw:
+            others = [
+                other
+                for other in (FALLBACK_SPEC_ENV, *FALLBACK_SPEC_ENV_ALIASES)
+                if other != name and str(os.environ.get(other, "") or "").strip()
+            ]
+            if others:
+                log.warning(
+                    "%s 与 %s 同时设置，按 %s 里的内容为准（另一个被忽略）",
+                    name,
+                    "、".join(others),
+                    name,
+                )
+            return raw, name
+    # 一个都没设：看看是不是拼错了名字
+    for other in _FALLBACK_SPEC_LOOKALIKES:
+        if str(os.environ.get(other, "") or "").strip():
+            log.warning(
+                "环境变量 %s 不是有效的备用池变量名（应为 %s 或 %s），已忽略；"
+                "备用池仍按 settings.json 里的内容生效",
+                other,
+                FALLBACK_SPEC_ENV,
+                FALLBACK_SPEC_ENV_ALIASES[0],
+            )
+            break
+    return "", ""
+
 #: 单条备用的字段分隔符与条目分隔符。用 ``|`` 与 ``;`` 是因为它们不会出现在
 #: base_url / model 里，也不像逗号那样被 shell 或 compose 当成列表语法。
 _FIELD_SEP = "|"
@@ -141,6 +194,10 @@ def parse_fallback_spec(text: Any, *, default_key: str = "") -> tuple[list[Any],
     return entries, problems
 
 
+#: 已经说明过的 PA_AGENT_FALLBACKS 内容；同一份配置只播报一次。
+_ANNOUNCED_SPECS: set[str] = set()
+
+
 def env_fallbacks(*, default_key: str = "") -> list[Any]:
     """``PA_AGENT_FALLBACKS`` 里声明的备用池（服务器上改一行即可生效）。
 
@@ -152,16 +209,19 @@ def env_fallbacks(*, default_key: str = "") -> list[Any]:
     import os
 
     log = logging.getLogger(__name__)
-    raw = str(os.environ.get(FALLBACK_SPEC_ENV, "") or "").strip()
+    raw, source = read_fallback_spec()
     if not raw:
         return []
     entries, problems = parse_fallback_spec(raw, default_key=default_key)
     for problem in problems:
         log.warning("%s 配置有误，已跳过：%s", FALLBACK_SPEC_ENV, problem)
-    if entries:
+    # 这是「配置长什么样」的一次性说明，不是每次请求的进度。
+    # combined_fallback_chain 每轮分析都会重新解析，不去重就会每轮刷一条。
+    if entries and raw not in _ANNOUNCED_SPECS:
+        _ANNOUNCED_SPECS.add(raw)
         log.info(
             "%s 提供了 %d 条备用接口：%s",
-            FALLBACK_SPEC_ENV,
+            source,
             len(entries),
             ", ".join(str(getattr(e, "name", "") or e.model) for e in entries),
         )

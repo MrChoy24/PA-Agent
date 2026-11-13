@@ -334,6 +334,8 @@ class TwoStageOrchestrator:
         pending_writer: "PendingWriter",
         exp_reader: "ExperienceReader",
         settings: Optional["Settings"] = None,
+        *,
+        config_writable: bool = True,
     ) -> None:
         self._client = client
         self._assembler = assembler
@@ -342,6 +344,11 @@ class TwoStageOrchestrator:
         self._pending_writer = pending_writer
         self._exp_reader = exp_reader
         self._settings = settings
+        # 无头守护进程以「配置只读」模式运行：settings.json 是 GUI 与 daemon
+        # 共用的唯一配置源，daemon 若在降级时回写就会把用户在 GUI 里刚改的
+        # 参数整份覆盖掉（save_settings 是全量覆盖，不是 diff）。
+        # 只读模式下这些降级只改内存，不落盘。
+        self._config_writable: bool = bool(config_writable)
         # 内部实现细节：不输出渠道信息。
         # over. While True, schema / enum validation is relaxed: the fallback
         # model's free-text answers are accepted so the GUI can still render,
@@ -2068,11 +2075,10 @@ class TwoStageOrchestrator:
             return False
 
         self._client.update_provider(self._settings.provider)
-        try:
-            save_settings(self._settings, SETTINGS_JSON_PATH)
-            update_api_key(self._settings.provider.api_key)
-        except Exception as save_exc:  # noqa: BLE001
-            logger.warning("QClaw fallback applied but settings save failed: %s", save_exc)
+        self._persist_provider_switch(
+            "QClaw", lambda: save_settings(self._settings, SETTINGS_JSON_PATH)
+        )
+        update_api_key(self._settings.provider.api_key)
 
         logger.info(
             "QClaw auto-fallback: model=%s base_url=%s",
@@ -2103,11 +2109,10 @@ class TwoStageOrchestrator:
             return False
 
         self._client.update_provider(self._settings.provider)
-        try:
-            save_settings(self._settings, SETTINGS_JSON_PATH)
-            update_api_key(self._settings.provider.api_key)
-        except Exception as save_exc:  # noqa: BLE001
-            logger.warning("WorkBuddy fallback applied but settings save failed: %s", save_exc)
+        self._persist_provider_switch(
+            "WorkBuddy", lambda: save_settings(self._settings, SETTINGS_JSON_PATH)
+        )
+        update_api_key(self._settings.provider.api_key)
 
         logger.info(
             "WorkBuddy auto-fallback: model=%s base_url=%s",
@@ -2140,19 +2145,40 @@ class TwoStageOrchestrator:
             return False
 
         self._client.update_provider(self._settings.provider)
-        try:
-            save_settings(self._settings, SETTINGS_JSON_PATH)
-            update_api_key(self._settings.provider.api_key)
-        except Exception as save_exc:  # noqa: BLE001
-            logger.warning(
-                "TRAE Work CN fallback applied but settings save failed: %s", save_exc
-            )
+        self._persist_provider_switch(
+            "TRAE Work CN", lambda: save_settings(self._settings, SETTINGS_JSON_PATH)
+        )
+        update_api_key(self._settings.provider.api_key)
 
         logger.info(
             "TRAE Work CN auto-fallback: model=%s base_url=%s",
             self._settings.provider.model,
             self._settings.provider.base_url,
         )
+        return True
+
+    def _persist_provider_switch(self, label: str, save: "Callable[[], Any]") -> bool:
+        """把降级后的 provider 写回 settings.json —— 但只在「配置可写」模式。
+
+        无头守护进程以 ``config_writable=False`` 运行：``settings.json`` 由
+        GUI 与 daemon 共用，daemon 手里是启动那一刻的快照，若在这里整份
+        写回，就会把用户随后在 GUI 里改的杠杆/保证金/风控参数全部抹掉。
+        只读模式下降级仍生效（内存里的 provider 已换），只是不落盘。
+
+        Returns ``True`` 表示确实写入了磁盘。
+        """
+        if not self._config_writable:
+            logger.info(
+                "%s 降级已生效（仅内存）。当前为配置只读模式（无头守护进程），"
+                "不回写 settings.json，以免覆盖 GUI 侧的改动。",
+                label,
+            )
+            return False
+        try:
+            save()
+        except Exception as save_exc:  # noqa: BLE001
+            logger.warning("%s fallback applied but settings save failed: %s", label, save_exc)
+            return False
         return True
 
     @staticmethod

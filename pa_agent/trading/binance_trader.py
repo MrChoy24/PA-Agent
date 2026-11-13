@@ -58,6 +58,10 @@ from pa_agent.trading.common import (
     ORDER_TYPE_MARKET,
     POSITION_LONG,
     POSITION_SHORT,
+    PROTECT_STOP_LOSS,
+    PROTECT_TAKE_PROFIT_1,
+    PROTECT_TAKE_PROFIT_2,
+    ProtectionOrder,
     TradeResult,
     clamp_leverage,
     floor_to_precision,
@@ -70,6 +74,7 @@ from pa_agent.trading.common import (
     to_float,
     to_text,
 )
+from pa_agent.util import throttle
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +112,8 @@ _FUTURES_PATHS: dict[str, str] = {
     "margin_type": "/fapi/v1/marginType",
     "position_mode": "/fapi/v1/positionSide/dual",
     "positions": "/fapi/v2/position",
+    # 条件单（止损/止盈）与普通下单同一个 endpoint，只是 type 不同
+    "conditional_order": "/fapi/v1/order",
 }
 
 _RECV_WINDOW_MS = 5000
@@ -310,6 +317,8 @@ class BinanceTrader:
             )
             url = f"{host}{path}?{query}" if query else f"{host}{path}"
             headers = {"X-MBX-APIKEY": self._api_key} if signed else {}
+            # 本地节流：同进程里所有 Binance 请求共用一个令牌桶。
+            throttle.acquire("binance")
             try:
                 resp = client.request(method, url, headers=headers)
             except Exception as exc:  # noqa: BLE001
@@ -1016,6 +1025,243 @@ class BinanceTrader:
             position_side=pos_side if is_futures else POSITION_LONG,
             margin_mode=mode if is_futures else MARGIN_ISOLATED,
         )
+
+    def place_protections(
+        self,
+        symbol: str,
+        *,
+        position_side: str = POSITION_LONG,
+        plans: list[tuple[str, float, float, str]],
+        market_type: str | None = None,
+    ) -> list[ProtectionOrder]:
+        """开仓成功后立刻把止损 / TP1 / TP2 挂成交易所侧条件单。
+
+        Binance U 本位永续的条件单与普通下单同一个 endpoint
+        （``POST /fapi/v1/order``），区别在 ``type``：
+
+        * 止损 → ``STOP_MARKET`` + ``stopPrice``
+        * 止盈 → ``TAKE_PROFIT_MARKET`` + ``stopPrice``
+
+        止损用 ``closePosition=true``（触发时平掉整个仓位，最稳，不依赖数量
+        精度）；TP1/TP2 用 ``quantity`` + ``reduceOnly`` 分批减仓，这样两段
+        止盈才能各自独立触发。
+
+        现货没有交易所侧条件单，直接返回「不支持」的中文原因，**不假装挂上**。
+        每条腿独立成败，绝不抛异常。
+        """
+        mkt = normalize_market_type(
+            market_type if market_type is not None else self._market_type
+        )
+        is_futures = mkt == MARKET_FUTURES
+        pos_side = normalize_position_side(position_side)
+        sym = to_binance_symbol(to_text(symbol))
+
+        if not is_futures:
+            return [
+                ProtectionOrder(
+                    kind=kind,
+                    trigger_price=to_float(price, 0.0),
+                    qty=to_float(qty, 0.0),
+                    message="Binance 现货不支持交易所侧止损/止盈条件单，需使用合约",
+                )
+                for kind, price, qty, _problem in plans
+            ]
+
+        if not self._has_credentials():
+            return [
+                ProtectionOrder(
+                    kind=kind,
+                    trigger_price=to_float(price, 0.0),
+                    qty=to_float(qty, 0.0),
+                    message="未填写 Binance API Key/Secret，无法挂保护单",
+                )
+                for kind, price, qty, _problem in plans
+            ]
+        if not sym:
+            return [
+                ProtectionOrder(
+                    kind=kind,
+                    trigger_price=to_float(price, 0.0),
+                    qty=to_float(qty, 0.0),
+                    message="交易对（symbol）为空",
+                )
+                for kind, price, qty, _problem in plans
+            ]
+
+        rules = self._symbol_filters(sym, mkt)
+        tick = to_float(rules.get("tick"), 0.0)
+        step = to_float(rules.get("step"), 0.0)
+        min_qty = to_float(rules.get("min_qty"), 0.0)
+        hedge = self._is_hedge_mode()
+        close_side = "SELL" if pos_side == POSITION_LONG else "BUY"
+
+        # 先看两段止盈各自能否成单：拆不开就合并成一条
+        tp_total_qty = 0.0
+        tp_legs_splittable = True
+        for _kind, _price, _qty, _problem in plans:
+            if _kind in (PROTECT_TAKE_PROFIT_1, PROTECT_TAKE_PROFIT_2):
+                _leg = floor_to_step(to_float(_qty, 0.0), step)
+                if _leg <= 0 or (min_qty > 0 and _leg < min_qty):
+                    tp_legs_splittable = False
+                tp_total_qty += to_float(_qty, 0.0)
+        merge_tp = (not tp_legs_splittable) and tp_total_qty > 0
+
+        out: list[ProtectionOrder] = []
+        for kind, price, qty, problem in plans:
+            trigger = to_float(price, 0.0)
+            leg_qty = to_float(qty, 0.0)
+
+            if problem:
+                out.append(
+                    ProtectionOrder(
+                        kind=kind,
+                        trigger_price=round(trigger, 8),
+                        qty=round(leg_qty, 8),
+                        message=problem,
+                    )
+                )
+                continue
+
+            trigger_px = floor_to_precision(trigger, tick) if tick > 0 else trigger
+            if trigger_px <= 0:
+                out.append(
+                    ProtectionOrder(
+                        kind=kind,
+                        trigger_price=round(trigger, 8),
+                        qty=round(leg_qty, 8),
+                        message=f"触发价 {format_decimal(trigger)} 取整后无效",
+                    )
+                )
+                continue
+
+            is_stop = kind == PROTECT_STOP_LOSS
+
+            # 仓位太小、TP1/TP2 拆出来的两段都低于 minQty 时，
+            # 把两段止盈合并成一条（用 TP1 的价、两段合起来的量）。
+            # 宁可少赚一点，也不要出现「止盈整段挂不上」。
+            if kind == PROTECT_TAKE_PROFIT_2 and merge_tp:
+                out.append(
+                    ProtectionOrder(
+                        kind=kind,
+                        trigger_price=round(trigger, 8),
+                        qty=round(leg_qty, 8),
+                        message=(
+                            "仓位太小，TP1/TP2 无法拆分成两张单，"
+                            "已合并：整仓在 TP1 挂止盈"
+                        ),
+                    )
+                )
+                continue
+            if kind == PROTECT_TAKE_PROFIT_1 and merge_tp:
+                leg_qty = tp_total_qty
+
+            params: dict[str, Any] = {
+                "symbol": sym,
+                "side": close_side,
+                "type": "STOP_MARKET" if is_stop else "TAKE_PROFIT_MARKET",
+                "stopPrice": format_decimal(trigger_px),
+                # 标记价触发：比成交价触发更不容易被一根插针扫掉
+                "workingType": "MARK_PRICE",
+            }
+
+            if hedge:
+                params["positionSide"] = (
+                    POSITION_LONG.upper() if pos_side == POSITION_LONG else POSITION_SHORT.upper()
+                )
+
+            if is_stop:
+                # 止损永远全量：closePosition 不受数量精度影响，触发即平掉整仓
+                params["closePosition"] = "true"
+                sent_qty = leg_qty
+            else:
+                qty_leg = floor_to_step(leg_qty, step)
+                if qty_leg <= 0:
+                    out.append(
+                        ProtectionOrder(
+                            kind=kind,
+                            trigger_price=round(trigger_px, 8),
+                            qty=round(leg_qty, 8),
+                            message=(
+                                f"数量 {format_decimal(leg_qty)} 向下取整到 "
+                                f"stepSize={format_decimal(step)} 后为 0"
+                            ),
+                        )
+                    )
+                    continue
+                if min_qty > 0 and qty_leg < min_qty:
+                    out.append(
+                        ProtectionOrder(
+                            kind=kind,
+                            trigger_price=round(trigger_px, 8),
+                            qty=round(qty_leg, 8),
+                            message=(
+                                f"数量 {format_decimal(qty_leg)} 低于最小下单量 "
+                                f"minQty={format_decimal(min_qty)}"
+                            ),
+                        )
+                    )
+                    continue
+                params["quantity"] = format_decimal(qty_leg)
+                if not hedge:
+                    params["reduceOnly"] = "true"
+                sent_qty = qty_leg
+
+            payload, err = self._request(
+                "POST",
+                self._path("conditional_order", mkt),
+                params,
+                signed=True,
+                market=mkt,
+            )
+            if payload is None or not isinstance(payload, dict):
+                out.append(
+                    ProtectionOrder(
+                        kind=kind,
+                        trigger_price=round(trigger_px, 8),
+                        qty=round(sent_qty, 8),
+                        message=err or "Binance 保护单提交失败（状态未知，请到交易所核对）",
+                        raw={"request": params},
+                    )
+                )
+                continue
+
+            order_id = str(payload.get("orderId", "") or "")
+            status = str(payload.get("status", "") or "")
+            if payload.get("code") not in (None, 0):
+                out.append(
+                    ProtectionOrder(
+                        kind=kind,
+                        trigger_price=round(trigger_px, 8),
+                        qty=round(sent_qty, 8),
+                        message=(
+                            f"Binance 保护单被拒 {payload.get('code')}: "
+                            f"{payload.get('msg', '')}"
+                        ).strip(),
+                        raw=dict(payload),
+                    )
+                )
+                continue
+
+            out.append(
+                ProtectionOrder(
+                    kind=kind,
+                    ok=True,
+                    trigger_price=round(trigger_px, 8),
+                    qty=round(sent_qty, 8),
+                    order_id=order_id,
+                    raw=dict(payload),
+                )
+            )
+            logger.info(
+                "Binance 保护单已挂 %s %s %s 触发价 %s status=%s orderId=%s",
+                sym,
+                params.get("type"),
+                close_side,
+                format_decimal(trigger_px),
+                status or "—",
+                order_id or "—",
+            )
+        return out
 
     def close_position(
         self, symbol: str, position_side: str = POSITION_LONG
