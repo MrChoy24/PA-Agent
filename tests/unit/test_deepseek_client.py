@@ -675,3 +675,131 @@ def test_stream_chat_still_separates_pure_reasoning_chunks():
 
     assert reply.reasoning_content == "只有思考"
     assert reply.content == ""
+
+# ── 硅基流动：明知不回传 reasoning_content，不能刷告警 ───────────────────────
+
+
+def test_is_siliconflow_recognises_the_gateway():
+    """api.siliconflow.cn 要被认出来，别的网关不能误判。"""
+    from pa_agent.ai.deepseek_client import _is_siliconflow
+
+    assert _is_siliconflow("https://api.siliconflow.cn/v1") is True
+    assert _is_siliconflow("https://api.siliconflow.cn") is True
+    assert _is_siliconflow("HTTPS://API.SILICONFLOW.CN/V1") is True
+    assert _is_siliconflow("https://api.scnet.cn/api/llm/v1") is False
+    assert _is_siliconflow("https://open.bigmodel.cn/api/paas/v4") is False
+    assert _is_siliconflow("") is False
+
+
+def test_provider_returns_reasoning_excludes_only_siliconflow():
+    """只有硅基流动被排除；其他网关保持「会回传」，别把真信号一起关掉。"""
+    from pa_agent.ai.deepseek_client import _provider_returns_reasoning
+
+    siliconflow = AIProviderSettings(
+        model="deepseek-ai/DeepSeek-V4-Flash",
+        base_url="https://api.siliconflow.cn/v1",
+    )
+    others = [
+        AIProviderSettings(model="GLM-5.3-Flash", base_url="https://api.scnet.cn/api/llm/v1"),
+        AIProviderSettings(
+            model="glm-4.7-flash", base_url="https://open.bigmodel.cn/api/paas/v4"
+        ),
+        AIProviderSettings(
+            model="deepseek-v4-flash", base_url="https://api.deepseek.com"
+        ),
+    ]
+    assert _provider_returns_reasoning(siliconflow) is False
+    for settings in others:
+        assert _provider_returns_reasoning(settings) is True
+
+
+def _content_only_chunks() -> list:
+    """硅基流动的真实形态：delta 只有 content / role，永无 reasoning_content。"""
+    from types import SimpleNamespace
+
+    def _chunk(content):
+        delta = SimpleNamespace(reasoning_content=None, content=content)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(delta=delta, finish_reason=None)],
+            usage=None,
+            id="chunk",
+            model="m",
+        )
+
+    return [_chunk('{"order_type"'), _chunk(':"不下单"}')]
+
+
+def _short_warns(caplog) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if "reasoning_content is very short" in r.getMessage()
+    ]
+
+
+def test_siliconflow_short_reasoning_does_not_warn(caplog):
+    """正面用例：thinking 开着、reasoning 为空，硅基流动不许告警。
+
+    真实场景见 pa-agent 2026-11-15 的运行日志 —— 一天 21 条
+    「reasoning_content is very short (0 chars)」，全是这个网关的必然产物。
+
+    这里**不能**把 ``stream_chat`` 换掉：那样连要测的告警逻辑一起 mock 了，
+    不管代码怎么写都会通过。只换底层 OpenAI 客户端，让真实流程跑完。
+    """
+    import logging
+
+    settings = AIProviderSettings(
+        model="deepseek-ai/DeepSeek-V4-Flash",
+        base_url="https://api.siliconflow.cn/v1",
+        api_key="sk-test-1234abcd",
+        thinking=True,
+    )
+    client = DeepSeekClient(settings)
+
+    class _Completions:
+        def create(self, **kwargs):
+            return iter(_content_only_chunks())
+
+    class _FakeOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = MagicMock(completions=_Completions())
+
+    with caplog.at_level(logging.WARNING):
+        with patch("pa_agent.ai.deepseek_client._OpenAI", _FakeOpenAI):
+            reply = client.stream_chat([{"role": "user", "content": "hi"}])
+
+    # 先确认真的走到了告警那一段之后：正文必须收全
+    assert reply.content == '{"order_type":"不下单"}'
+    assert reply.reasoning_content == ""
+    assert _short_warns(caplog) == [], f"硅基流动不该报这条告警：{_short_warns(caplog)}"
+
+
+def test_other_gateways_still_warn_on_short_reasoning(caplog):
+    """反向对照：同样的 chunk 打非硅基流动网关，告警必须照常出现。
+
+    没有这条，上一个用例的「不告警」可能只是告警逻辑被整体关掉了。
+    """
+    import logging
+
+    settings = AIProviderSettings(
+        model="GLM-5.3-Flash",
+        base_url="https://api.scnet.cn/api/llm/v1",
+        api_key="sk-test-1234abcd",
+        thinking=True,
+    )
+    client = DeepSeekClient(settings)
+
+    class _Completions:
+        def create(self, **kwargs):
+            return iter(_content_only_chunks())
+
+    class _FakeOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = MagicMock(completions=_Completions())
+
+    with caplog.at_level(logging.WARNING):
+        with patch("pa_agent.ai.deepseek_client._OpenAI", _FakeOpenAI):
+            client.stream_chat([{"role": "user", "content": "hi"}])
+
+    warns = _short_warns(caplog)
+    assert len(warns) == 1, f"非硅基流动网关应当告警一次，实际 {len(warns)} 条"

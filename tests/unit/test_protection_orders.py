@@ -160,7 +160,13 @@ class _FakeClient:
         )
 
     def place_protections(
-        self, symbol: str, *, position_side: str, plans: list, market_type: str = ""
+        self,
+        symbol: str,
+        *,
+        position_side: str,
+        plans: list,
+        market_type: str = "",
+        replace_on_mismatch: bool = True,
     ) -> list[ProtectionOrder]:
         self.protections.append(
             {
@@ -168,6 +174,7 @@ class _FakeClient:
                 "position_side": position_side,
                 "plans": plans,
                 "market_type": market_type,
+                "replace_on_mismatch": replace_on_mismatch,
             }
         )
         if self._protection_error is not None:
@@ -294,9 +301,16 @@ def test_protection_exception_never_breaks_the_entry(log_path: Path) -> None:
     assert all("boom" in p.message for p in out.result.protections)
 
 
-def test_invalid_stop_is_reported_but_targets_still_placed(log_path: Path) -> None:
+def test_invalid_stop_blocks_the_entry_before_any_order(log_path: Path) -> None:
+    """做多却把止损放在入场价上方 → 必须**开仓之前**就拦下。
+
+    2026-11-14 模拟盘实测的原始缺陷：几何校验只在挂保护单那一步做，
+    于是仓位照常开出来、三条腿全被交易所拒掉 —— 仓位裸奔。
+    Gate 4.5 的意义就是把这种单子挡在开仓之前。
+    """
     trader = AutoTrader(_opts(log_path), venue="binance")
-    trader._trader = _FakeClient()
+    client = _FakeClient()
+    trader._trader = client
 
     out = trader.evaluate(
         _decision(stop_loss_price=2010.0),  # 做多却把止损放在入场价上方
@@ -305,15 +319,11 @@ def test_invalid_stop_is_reported_but_targets_still_placed(log_path: Path) -> No
         last_price=2000.0,
     )
 
-    assert out.executed is True
-    assert out.result is not None
-    stop = out.result.protections[0]
-    assert stop.kind == PROTECT_STOP_LOSS
-    assert stop.ok is False
-    assert "没有低于入场价" in stop.message
-    # 两个止盈仍然照挂
-    assert out.result.protections[1].ok is True
-    assert out.result.protections[2].ok is True
+    assert out.executed is False
+    assert out.reason.startswith("invalid-protection")
+    assert "没有低于入场价" in out.reason
+    assert client.orders == [], "不该向交易所发出任何开仓委托"
+    assert client.protections == [], "也不该发出任何保护单"
 
 
 def test_dry_run_previews_protection_prices(log_path: Path) -> None:
@@ -1017,6 +1027,117 @@ def test_resume_never_raises_when_the_client_explodes(log_path: Path) -> None:
 
     assert handled is False
 
+
+class _FailingProtectionClient(_ResumeClient):
+    """持仓在、但每一条保护单都被交易所拒掉（51023 那一类）。"""
+
+    def __init__(self, *, positions=None) -> None:
+        super().__init__(positions=positions)
+        self.attempts = 0
+
+    def place_protections(self, symbol, *, position_side, plans,
+                          market_type="", replace_on_mismatch=True):
+        self.attempts += 1
+        self.protections.append(
+            {"symbol": symbol, "position_side": position_side, "plans": plans}
+        )
+        return [
+            ProtectionOrder(kind=kind, trigger_price=price, qty=qty,
+                            message="51023 Position doesnt exist")
+            for kind, price, qty, _problem in plans
+        ]
+
+
+def _held_short(**overrides):
+    pos = {
+        "symbol": "ETH-USDT-SWAP",
+        "position_side": "short",
+        "size": 0.82,
+        "entry_price": 1819.47,
+        "mark_price": 1819.0,
+        "unrealized_pnl": 0.0,
+        "leverage": 10,
+        "margin": 20.0,
+    }
+    pos.update(overrides)
+    return pos
+
+def test_resume_uses_the_exchange_position_side_not_the_record(log_path: Path) -> None:
+    """2026-11-16 线上事故：流水把 short 记成 long，补挂按 long 挂全被拒。
+
+    持仓方向是唯一权威，流水的 position_side 只在拿不到持仓方向时兜底。
+    """
+    _write_pending(log_path)  # 流水里写的是 long
+    trader = AutoTrader(_opts(log_path), venue="okx")
+    client = _ResumeClient(positions=[_held_short()])
+    trader._trader = client
+
+    handled, _ = trader.resume_pending_trigger()
+
+    assert handled is True
+    assert client.protections[0]["position_side"] == "short"
+
+
+def test_every_protection_failing_does_not_mark_resumed(log_path: Path) -> None:
+    """0 条挂成功绝不能落 trigger-resumed，否则之后永远不会再重试。"""
+    _write_pending(log_path)
+    trader = AutoTrader(_opts(log_path), venue="okx")
+    client = _FailingProtectionClient(positions=[_held_short()])
+    trader._trader = client
+
+    handled, message = trader.resume_pending_trigger()
+
+    assert handled is False
+    assert message == ""
+    kinds = [json.loads(line).get("kind")
+             for line in log_path.read_text(encoding="utf-8").strip().splitlines()]
+    assert "trigger-resumed" not in kinds[1:]
+    failure = trader.last_resume_failure
+    assert isinstance(failure, dict)
+    assert failure["final"] is False
+    assert failure["attempts"] == 1
+    assert failure["position_side"] == "short"
+    assert failure["reasons"], "失败明细里必须带交易所给的原因"
+
+    again, _ = trader.resume_pending_trigger()
+    assert again is False
+    assert client.attempts == 2
+
+
+def test_resume_gives_up_after_repeated_failures(log_path: Path) -> None:
+    """连续失败到上限才放弃，并落一条 gave-up 标记 + final 告警。"""
+    from pa_agent.trading.auto_trader import _RESUME_MAX_ATTEMPTS
+
+    _write_pending(log_path)
+    trader = AutoTrader(_opts(log_path), venue="okx")
+    client = _FailingProtectionClient(positions=[_held_short()])
+    trader._trader = client
+
+    for _ in range(_RESUME_MAX_ATTEMPTS):
+        trader.resume_pending_trigger()
+
+    assert client.attempts == _RESUME_MAX_ATTEMPTS
+    assert trader.last_resume_failure["final"] is True
+    last = json.loads(log_path.read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert last["kind"] == "trigger-resumed"
+    assert last["status"] == "gave-up"
+    trader.resume_pending_trigger()
+    assert client.attempts == _RESUME_MAX_ATTEMPTS
+
+
+def test_success_clears_the_failure_flag(log_path: Path) -> None:
+    """重试成功后必须清掉告警状态，否则守护进程每轮都重复推裸奔告警。"""
+    _write_pending(log_path)
+    trader = AutoTrader(_opts(log_path), venue="okx")
+    trader._trader = _FailingProtectionClient(positions=[_held_short()])
+    trader.resume_pending_trigger()
+    assert trader.last_resume_failure is not None
+
+    trader._trader = _ResumeClient(positions=[_held_short()])
+    handled, _ = trader.resume_pending_trigger()
+
+    assert handled is True
+    assert trader.last_resume_failure is None
 
 def test_pending_record_keeps_the_protection_plan(log_path: Path) -> None:
     """下单时就要把「触发后挂哪几条」写进 JSONL，否则重启后无从补挂。"""

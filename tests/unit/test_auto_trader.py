@@ -208,16 +208,28 @@ def test_price_deviation_within_limit_passes(log_path: Path) -> None:
     # 76000 → 76004，偏离 0.005%，低于默认 0.3% 容忍度
     trader = _trader_with_price(log_path, 76004.0, max_price_deviation_pct=0.3)
     out = trader.evaluate(
-        _decision(entry_price=76000.0), symbol="BTCUSDT", timeframe="15m"
+        # 入场价改成 76000 时，止盈也必须跟着上移，否则 Gate 4.5 会以
+        # 「止盈在入场价下方」拦单 —— 那是另一个测试的职责。
+        _decision(entry_price=76000.0, take_profit_price=80000.0),
+        symbol="BTCUSDT",
+        timeframe="15m",
     )
     assert out.executed is True, out.reason
 
 
-def test_price_deviation_beyond_limit_blocks(log_path: Path) -> None:
-    # 76000 → 77000，偏离 1.32%，远超 0.3%
+def test_market_order_beyond_limit_blocks(log_path: Path) -> None:
+    # 市价单一定立即成交，所以 76000 → 77000（偏离 1.32%）照旧必须拦。
     trader = _trader_with_price(log_path, 77000.0, max_price_deviation_pct=0.3)
     out = trader.evaluate(
-        _decision(entry_price=76000.0), symbol="BTCUSDT", timeframe="15m"
+        # 入场价改成 76000 时，止盈也必须跟着上移，否则 Gate 4.5 会以
+        # 「止盈在入场价下方」拦单 —— 那是另一个测试的职责。
+        _decision(
+            order_type="市价单",
+            entry_price=76000.0,
+            take_profit_price=80000.0,
+        ),
+        symbol="BTCUSDT",
+        timeframe="15m",
     )
     assert out.executed is False
     assert out.reason.startswith("price-deviation")
@@ -230,7 +242,11 @@ def test_price_deviation_disabled_when_zero(log_path: Path) -> None:
     )
     trader._trader = client
     out = trader.evaluate(
-        _decision(entry_price=76000.0), symbol="BTCUSDT", timeframe="15m"
+        # 入场价改成 76000 时，止盈也必须跟着上移，否则 Gate 4.5 会以
+        # 「止盈在入场价下方」拦单 —— 那是另一个测试的职责。
+        _decision(entry_price=76000.0, take_profit_price=80000.0),
+        symbol="BTCUSDT",
+        timeframe="15m",
     )
     assert out.executed is True
     assert client.calls == 0, "关闭校验时不应发起取价请求"
@@ -240,7 +256,11 @@ def test_price_deviation_skipped_when_price_unavailable(log_path: Path) -> None:
     # 交易所取不到价（离线/接口异常）时不能误拦单
     trader = _trader_with_price(log_path, 0.0, max_price_deviation_pct=0.3)
     out = trader.evaluate(
-        _decision(entry_price=76000.0), symbol="BTCUSDT", timeframe="15m"
+        # 入场价改成 76000 时，止盈也必须跟着上移，否则 Gate 4.5 会以
+        # 「止盈在入场价下方」拦单 —— 那是另一个测试的职责。
+        _decision(entry_price=76000.0, take_profit_price=80000.0),
+        symbol="BTCUSDT",
+        timeframe="15m",
     )
     assert out.executed is True, out.reason
 
@@ -249,6 +269,122 @@ def test_price_deviation_defaults_to_off(log_path: Path) -> None:
     # 交易层默认关闭（0.0），保证单测与老调用方完全离线、行为不变
     trader = AutoTrader(_opts(log_path=str(log_path)), venue="okx")
     assert trader.max_price_deviation_pct == 0.0
+
+
+# ── 方案 A：只有「会立即成交的单」才看价差，等待单看风险距离 ─────────────────
+#
+# 背景（2026-11-15~16 实测）：做多限价单按价格行为挂在支撑上方、等回踩到
+# 才成交，这个「挂单价低于现价」的差距是策略本身，不是行情跑偏。原实现拿
+# 挂单价与现价直接比 0.6%，把 4 笔这类等待单全拦了。现在改成：
+#   市价单      → 照旧按百分比比（立即成交，价差就是真实成本）
+#   突破单      → 跳过（本来就等触发价）
+#   限价单      → 挂在会立即成交的那一侧时照旧比；挂在另一侧（等回踩/等反弹）
+#                 才跳过，改校验「挂单价距现价是否超过风险距离的 3 倍」
+
+
+def test_waiting_limit_buy_is_not_blocked_by_deviation(log_path: Path) -> None:
+    # 做多限价单挂在现价 1930 下方 1900 —— 等回踩，差距 1.58% 远超 0.6%
+    trader = _trader_with_price(log_path, 1930.0, max_price_deviation_pct=0.6)
+    out = trader.evaluate(
+        _decision(
+            entry_price=1900.0,
+            stop_loss_price=1880.0,
+            take_profit_price=1940.0,
+        ),
+        symbol="ETHUSDT",
+        timeframe="30m",
+    )
+    assert out.executed is True, out.reason
+
+
+def test_waiting_limit_sell_is_not_blocked_by_deviation(log_path: Path) -> None:
+    # 做空限价单挂在现价 1900 上方 1930 —— 等反弹。
+    # 必须走合约：现货只有做多，Gate 4.5 会把做空的止盈止损判成方向矛盾。
+    trader = _trader_with_price(
+        log_path, 1900.0, max_price_deviation_pct=0.6, market_type="futures"
+    )
+    out = trader.evaluate(
+        _decision(
+            order_direction="做空",
+            entry_price=1930.0,
+            stop_loss_price=1950.0,
+            take_profit_price=1890.0,
+        ),
+        symbol="ETHUSDT",
+        timeframe="30m",
+    )
+    assert out.executed is True, out.reason
+
+
+def test_marketable_limit_buy_is_still_checked(log_path: Path) -> None:
+    # 做多限价单挂到现价 1900 **上方** 1930：挂上去就会成交，等同市价，
+    # 价差护栏必须继续生效。
+    trader = _trader_with_price(log_path, 1900.0, max_price_deviation_pct=0.6)
+    out = trader.evaluate(
+        _decision(
+            entry_price=1930.0,
+            stop_loss_price=1910.0,
+            take_profit_price=1970.0,
+        ),
+        symbol="ETHUSDT",
+        timeframe="30m",
+    )
+    assert out.executed is False
+    assert out.reason.startswith("price-deviation")
+
+
+def test_trigger_order_skips_deviation(log_path: Path) -> None:
+    # 突破单本来就是「等价格穿到触发价」，与现价的差距不构成风险
+    trader = _trader_with_price(
+        log_path, 1900.0, max_price_deviation_pct=0.6, market_type="futures"
+    )
+    out = trader.evaluate(
+        _decision(
+            order_type="突破单",
+            entry_price=1930.0,
+            stop_loss_price=1910.0,
+            take_profit_price=1970.0,
+        ),
+        symbol="ETHUSDT",
+        timeframe="30m",
+    )
+    assert out.executed is True, out.reason
+
+
+def test_waiting_order_far_beyond_risk_distance_is_blocked(log_path: Path) -> None:
+    # 挂 1900、现价 2000，差距 100；而风险距离只有 10（1900-1890）。
+    # 100 > 10×3，说明决策价多半已失效，仍要拦。
+    trader = _trader_with_price(log_path, 2000.0, max_price_deviation_pct=0.6)
+    out = trader.evaluate(
+        _decision(
+            entry_price=1900.0,
+            stop_loss_price=1890.0,
+            take_profit_price=1940.0,
+        ),
+        symbol="ETHUSDT",
+        timeframe="30m",
+    )
+    assert out.executed is False
+    assert out.reason.startswith("price-deviation-pending")
+
+
+def test_waiting_order_without_stop_is_not_blocked(log_path: Path) -> None:
+    # 没有止损就没有风险距离可量，此时不做二次判定（交给 Gate 4 的白名单
+    # 与 require_stop_loss 管），不能因为量不出来就拒单。
+    dec = _decision(
+        entry_price=1900.0,
+        take_profit_price=1940.0,
+    )
+    dec.pop("stop_loss_price")
+    trader = _trader_with_price(
+        log_path, 2000.0, max_price_deviation_pct=0.6, require_stop_loss=False
+    )
+    out = trader.evaluate(
+        dec,
+        symbol="ETHUSDT",
+        timeframe="30m",
+    )
+    assert out.executed is True, out.reason
 
 
 # ── 工具函数 ─────────────────────────────────────────────────────────────────

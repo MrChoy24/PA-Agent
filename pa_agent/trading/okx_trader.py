@@ -497,6 +497,43 @@ class OKXTrader:
                     return price
         return 0.0
 
+    def _order_fill_info(
+        self, inst_id: str, ord_id: str, *, retries: int = 3
+    ) -> dict[str, Any]:
+        """查一笔委托的成交状态 ``{avg_px, fill_sz, state}``。
+
+        与 :meth:`_fill_price_for` 的区别：这里同时把 ``accFillSz`` 与
+        ``state`` 取回来，用来判断「限价单到底成交了没有」。
+        限价单刚挂出时是 ``live``、``accFillSz=0``，此时**绝不能**去挂
+        保护单 —— 交易所侧还没有持仓，三条腿必然全被拒。
+        """
+        info: dict[str, Any] = {"avg_px": 0.0, "fill_sz": 0.0, "state": ""}
+        if not ord_id:
+            return info
+        delay = 0.25
+        for attempt in range(max(1, retries)):
+            payload, err = self._request(
+                "GET",
+                _ORDER_DETAIL_PATH,
+                {"instId": inst_id, "ordId": ord_id},
+                signed=True,
+            )
+            if payload is None:
+                logger.debug("OKX 查询委托状态失败（%s/%s）: %s", inst_id, ord_id, err)
+                return info
+            for item in payload.get("data", ()) or ():
+                if not isinstance(item, dict):
+                    continue
+                info["avg_px"] = to_float(item.get("avgPx"), 0.0)
+                info["fill_sz"] = to_float(item.get("accFillSz"), 0.0)
+                info["state"] = str(item.get("state") or "")
+                if info["fill_sz"] > 0 or info["state"] == "filled":
+                    return info
+            if attempt + 1 < retries:
+                time.sleep(delay)
+                delay *= 2
+        return info
+
     def _fill_price_for(self, inst_id: str, ord_id: str, *, retries: int = 3) -> float:
         """查一笔委托的真实成交均价 ``avgPx``；查不到返回 ``0.0``。
 
@@ -1159,9 +1196,20 @@ class OKXTrader:
         # 真实成交均价：市价单的 order_price 是 0，必须回查 avgPx。
         # 拿不到（网络抖动/委托还没成交完）就退回限价或参考价，
         # 至少不会把 0 传出去让保护单的几何校验失去基准。
-        fill_price = self._fill_price_for(inst, ord_id)
+        #
+        # 同时要判断**这笔单有没有成交**：限价单刚挂上去是 ``live``、
+        # ``accFillSz=0``，此时交易所侧还没有持仓，上层若立刻去挂止损/
+        # 止盈，三条腿必然全被拒（2026-11-14 模拟盘实测）。市价单在正常
+        # 情况下会立刻返回 ``filled``，拿不到状态时按「已成交」处理以保持
+        # 旧行为（市价单失败会走上面的 sCode 分支，到不了这里）。
+        fill_info = self._order_fill_info(inst, ord_id)
+        fill_price = to_float(fill_info.get("avg_px"), 0.0)
         if fill_price <= 0:
             fill_price = order_price if order_price > 0 else ref_price
+        fill_state = str(fill_info.get("state") or "")
+        filled = (type_l != "limit") or fill_state == "filled" or (
+            not fill_state
+        )
 
         scope = "合约" if is_futures else "现货"
         return TradeResult(
@@ -1173,6 +1221,7 @@ class OKXTrader:
             order_type=type_l,
             qty=intended_qty,
             price=fill_price,
+            filled=filled,
             message=(
                 f"OKX {scope} {type_l} {side_l} {inst} 已提交"
                 f"（数量 {format_decimal(intended_qty) or '—'}，"
@@ -1189,6 +1238,32 @@ class OKXTrader:
             margin_mode=mode if is_futures else MARGIN_ISOLATED,
         )
 
+    def _cancel_algo_orders(self, inst_id: str, rows: list) -> int:
+        # 批量撤销在挂条件单，返回成功条数。
+        #
+        # 用于加仓后重建保护单：OKX 的 closeFraction=1 止损只允许一条
+        # （第二条报 51088），所以想换触发价必须先撤旧的，不能靠再挂一条覆盖。
+        # 撤单失败只记 warning —— 宁可留着旧保护单，也不能因为撤不掉就什么都不做。
+        targets = [
+            {"instId": inst_id, "algoId": str(r.get("algoId") or "")}
+            for r in rows
+            if isinstance(r, dict) and str(r.get("algoId") or "")
+        ]
+        if not targets:
+            return 0
+        payload, err = self._request(
+            "POST", _CANCEL_ALGO_PATH, body=targets, signed=True
+        )
+        if payload is None:
+            logger.warning("撤销 %s 旧条件单失败（%s），本次保留原有保护单", inst_id, err)
+            return 0
+        ok = 0
+        for item in payload.get("data", ()) or ():
+            if isinstance(item, dict) and str(item.get("sCode") or "") in ("", "0"):
+                ok += 1
+        logger.info("已撤销 %s 的 %d/%d 条旧条件单（准备重建保护单）", inst_id, ok, len(targets))
+        return ok
+
     def place_protections(
         self,
         inst_id: str,
@@ -1197,6 +1272,7 @@ class OKXTrader:
         plans: list[tuple[str, float, float, str]],
         market_type: str | None = None,
         margin_mode: str | None = None,
+        replace_on_mismatch: bool = True,
     ) -> list[ProtectionOrder]:
         """开仓成功后立刻把止损 / TP1 / TP2 挂成交易所侧条件单。
 
@@ -1281,25 +1357,115 @@ class OKXTrader:
         # 双向持仓模式不可用（51329）→ 那种情况退回收敛到计划量的固定 sz。
         sl_use_close_fraction = not self._is_long_short_mode()
 
-        # 幂等守卫：已经有条件单在场时，不要再叠一份。
-        # 止损用 closeFraction=1 时 OKX 会以 51088 拒掉第二条（天然防重），
-        # 但止盈腿是普通 sz 条件单，重复调用会**叠成双份**（实测：重启后
-        # 补挂一次，场上从 3 条变 5 条，TP1/TP2 各多一条 → 多平一倍仓位）。
-        # 所以这里先查一次在挂条件单：止损腿已有全平单就跳过，止盈腿
-        # 按 (方向, 触发价) 判断是否已经存在。
+        # 幂等 + 重建：先查一次在挂条件单，再和本次想挂的价位比对。
+        #
+        # 为什么不能简单地「有一条就跳过」：止损用 closeFraction=1 时 OKX
+        # 以 51088 拒掉第二条（天然防重），若只认「已有全平止损就跳过」，
+        # 加仓后止损会永远停在第一次开仓的触发价（2026-11-14 模拟盘实测：
+        # 第二次开仓止损应是 1874.24，场上仍挂 1816.52），同时止盈会在旧的两
+        # 条之外再叠两条 → 止盈总量翻倍、止损偏松，两头都错。
+        #
+        # 也不能简单地「每次都撤了重挂」：容器重启后 resume 会再调一次本函数，
+        # 那时仓位没变、价位也没变，撤了重挂等于平白多一轮交易所请求，还会
+        # 在撤单与重挂之间留出没有保护单的空窗。
+        #
+        # 所以按「价位是否仍然一致」决定：一致 → 跳过（幂等）；不一致 →
+        # 撤掉旧的再按新价重建（加仓后止损跟上、止盈不叠单）。
         existing = self._pending_algo_orders(inst)
-        # 净持仓模式下 OKX 回显的 posSide 是字面量 ``"net"``，不是 "long"/"short"，
-        # 所以这里要把 ``""``、``"net"`` 和当前方向都认作同一条。
-        existing_sl_all = any(
-            str(a.get("closeFraction") or "") == "1"
-            and str(a.get("posSide") or "") in ("", "net", pos_side)
-            for a in existing
+
+        def _same_side(row: dict) -> bool:
+            # 净持仓模式下 OKX 回显的 posSide 是字面量 ``"net"``，不是
+            # "long"/"short"，所以 ``""``、``"net"`` 和当前方向都算同一条。
+            return str(row.get("posSide") or "") in ("", "net", pos_side)
+
+        def _px_close(a: float, b: float) -> bool:
+            tol = tick / 2 if tick > 0 else 1e-9
+            return abs(a - b) <= tol
+
+        existing_sl_rows = [
+            r for r in existing
+            if _same_side(r) and str(r.get("closeFraction") or "") == "1"
+        ]
+        existing_tp_rows = [
+            r for r in existing
+            if _same_side(r) and str(r.get("tpTriggerPx") or "").strip()
+        ]
+
+        # 本次想挂的价位（problem 非空的腿本来就不会挂，不参与比对）
+        want_sl = next(
+            (
+                to_float(p, 0.0)
+                for k, p, _q, pb in plans
+                if k == PROTECT_STOP_LOSS and not pb
+            ),
+            0.0,
         )
-        existing_tp_prices = {
-            to_float(a.get("tpTriggerPx"), 0.0)
-            for a in existing
-            if str(a.get("tpTriggerPx") or "").strip()
-        }
+        want_tps = [
+            to_float(p, 0.0)
+            for k, p, _q, pb in plans
+            if k in (PROTECT_TAKE_PROFIT_1, PROTECT_TAKE_PROFIT_2) and not pb
+        ]
+
+        have_sl_px = [
+            to_float(r.get("slTriggerPx"), 0.0) for r in existing_sl_rows
+        ]
+        have_tp_px = [to_float(r.get("tpTriggerPx"), 0.0) for r in existing_tp_rows]
+
+        sl_matches = (
+            bool(sl_use_close_fraction)
+            and want_sl > 0
+            and len(have_sl_px) == 1
+            and _px_close(have_sl_px[0], want_sl)
+        )
+        tp_matches = (
+            bool(want_tps)
+            and len(have_tp_px) == len(want_tps)
+            and all(any(_px_close(w, h) for h in have_tp_px) for w in want_tps)
+        )
+
+        # 加仓场景（真实缺陷，2026-11-14 模拟盘实测）：第二次开仓后持仓翻倍、
+        # 均价变了，但旧止损仍是第一次的触发价，止盈还会再叠两条 —— 结果是
+        # 「止损偏松 + 止盈多出一倍」。
+        #
+        # 做法是**逐条按价位比对**，而不是「有一致就整体跳过 / 不一致就整体撤」：
+        # 价位一致的腿保留（重启补挂不会叠单、不会平白多一轮空窗），价位不一致
+        # 的腿才撤掉重挂（加仓后止损跟上新均价）。
+        if replace_on_mismatch and existing:
+            to_cancel: list[dict] = []
+            # 止损：只在「本次确实想挂止损」时才谈得上比对；
+            # 决策没给止损就别去动场上已有的那条。
+            matched_sl = sl_matches
+            if want_sl > 0 and not matched_sl:
+                to_cancel.extend(existing_sl_rows)
+            # 止盈：本次想挂的价位逐条在场上找，找到就保留，找不到的旧单撤掉。
+            keep_tp_px: set[float] = set()
+            if want_tps:
+                remaining = list(want_tps)
+                for row in existing_tp_rows:
+                    px = to_float(row.get("tpTriggerPx"), 0.0)
+                    hit = next(
+                        (w for w in remaining if _px_close(w, px)), None
+                    )
+                    if hit is None:
+                        to_cancel.append(row)
+                    else:
+                        remaining.remove(hit)
+                        keep_tp_px.add(px)
+            else:
+                keep_tp_px = {
+                    to_float(r.get("tpTriggerPx"), 0.0) for r in existing_tp_rows
+                }
+            if to_cancel:
+                self._cancel_algo_orders(inst, to_cancel)
+            existing_sl_all = matched_sl
+            existing_tp_prices = keep_tp_px
+        else:
+            # 调用方明确要求「只补不改」时退回旧的纯幂等语义：
+            # 场上已有全平止损就跳过，已有同价止盈就跳过。
+            existing_sl_all = bool(existing_sl_rows)
+            existing_tp_prices = {
+                to_float(r.get("tpTriggerPx"), 0.0) for r in existing_tp_rows
+            }
 
         def _tp_already_exists(price: float) -> bool:
             """触发价是否已有一条止盈单。

@@ -169,3 +169,66 @@ def notify_trigger_resumed(
     except Exception as exc:  # noqa: BLE001 - 通知失败绝不影响交易
         logger.warning("突破单成交回报推送失败（忽略）：%s", exc)
         return False
+
+
+def notify_protection_failure(
+    report: Any,
+    *,
+    settings: "Settings | None" = None,
+    venue: str = "",
+) -> bool:
+    """仓位已成交、但保护单一条都没挂上时推一条告警。
+
+    ``report`` 是 :attr:`pa_agent.trading.auto_trader.AutoTrader.last_resume_failure`
+    （一个 dict）。这不是「成交回报」，而是**裸奔告警**：屏幕上写着止损 1844，
+    交易所里其实一张条件单都没有，出问题就是无上限亏损，所以它必须比成交回报
+    更响（标题带「⚠️ 保护单未挂上」）。
+
+    放在本模块而不是 ``dingtalk_notifier``：判断「该不该发」的逻辑要和成交回报
+    放一起，避免调用方各写一套。真正的发送仍走 ``send_markdown``。
+
+    只依赖本模块与 ``dingtalk_notifier``，不 import ``pa_agent.trading``，也不碰 GUI 层。
+    """
+    try:
+        if not isinstance(report, dict) or not report:
+            return False
+
+        from pa_agent.notify import dingtalk_notifier
+
+        if not dingtalk_notifier.dingtalk_is_active(settings):
+            return False
+
+        symbol = str(report.get("symbol") or report.get("venue_symbol") or "—")
+        side = str(report.get("position_side") or "")
+        side_text = "做多" if side == "long" else ("做空" if side == "short" else "—")
+        attempts = report.get("attempts") or 1
+        final = bool(report.get("final"))
+        reasons = [str(r) for r in (report.get("reasons") or []) if str(r).strip()]
+
+        lines = [
+            f"#### ⚠️ 保护单未挂上（{symbol}）",
+            "",
+            f"- 交易对：{symbol}（{venue or report.get('venue') or '—'}）",
+            f"- 方向：{side_text}　数量：{dingtalk_notifier._fmt(report.get('qty'))}",
+            f"- 成交均价：{dingtalk_notifier._fmt_price(report.get('entry_price'))}",
+            f"- 委托号：{report.get('order_id') or '—'}",
+            f"- 尝试次数：第 {attempts} 次" + ("（已放弃自动重试）" if final else "（下一轮继续重试）"),
+            "",
+        ]
+        if reasons:
+            lines.append("**交易所拒绝原因**")
+            lines.extend(f"- {r}" for r in reasons[:6])
+            lines.append("")
+        if final:
+            lines.append("> ❗ 仓位当前**没有止损/止盈**保护，请立即人工平仓或手动挂保护单。")
+        else:
+            lines.append("> 该仓位暂时没有保护单，程序会自动重试；若持续失败请人工介入。")
+
+        return dingtalk_notifier.send_markdown(
+            f"保护单未挂上（{symbol}）",
+            "\n".join(lines),
+            settings=settings,
+        )
+    except Exception as exc:  # noqa: BLE001 - 通知失败绝不影响交易
+        logger.warning("保护单失败告警推送失败（忽略）：%s", exc)
+        return False

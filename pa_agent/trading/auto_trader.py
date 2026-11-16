@@ -107,6 +107,24 @@ _DEFAULT_LOG_PATH = os.path.join("trade_records", "auto_orders.jsonl")
 #: 它只触发日志告警，不会拒单或平仓。
 DEFAULT_MAX_SLIPPAGE_BPS = 30.0
 
+#: 「等回踩 / 等反弹」的等待单能容忍挂单价距现价多远 —— 以**止损距离**
+#: （也就是这笔交易愿意承担的风险）为单位。
+#:
+#: 为什么要单独定一条：价差护栏（``max_price_deviation_pct``）的原意是
+#: 「行情源与下单所的价格跑偏了就别下单」。但限价单本来就可以挂在现价的
+#: 另一侧等回踩 —— 做多挂在现价下方、做空挂在现价上方，这个差距是**策略
+#: 设计的一部分**，不是行情异常。2026-11-15~16 实测有 4 笔这种等待单被
+#: 0.6% 的护栏拦掉，等于变相禁止「在边界挂单等回踩」这一价格行为核心做法。
+#:
+#: 所以等待单改看「挂单价离现价是不是远到离谱」：超过 3 倍风险距离，说明
+#: 决策价很可能算错了（或行情在这几分钟里彻底走坏），仍然要拦。
+MAX_PENDING_STOP_MULT = 3.0
+
+#: 补挂保护单连续失败多少次后放弃自动重试（并推一条「仓位裸奔」告警）。
+#: 3 次足够扛住一次网络抖动（每轮间隔 120 秒，共 6 分钟），又不会在
+#: 权限/参数这类「重试永远不会成功」的错误上无限打接口。
+_RESUME_MAX_ATTEMPTS = 3
+
 #: JSONL 里存的 kind 就是 PROTECT_* 常量本身，这里只是显式声明依赖，
 #: 已经打过「真实下单模式」告警的组合；同一个进程里只喊一次。
 #: 守护进程每 20 秒就会新建一个 AutoTrader 做「待触发补偿」检查，
@@ -168,6 +186,37 @@ def _parse_confidence(decision: Mapping[str, Any]) -> int | None:
         return max(0, min(100, int(float(str(raw).strip()))))
     except (ValueError, TypeError):
         return None
+
+
+def _waits_for_price(
+    order_type: str,
+    side: str,
+    price: float,
+    venue_price: float,
+) -> bool:
+    """这张单挂上去之后，是会**立即成交**还是要等价格回来？
+
+    - ``MARKET``：一定立即成交，价差护栏照常生效。
+    - ``TRIGGER``（突破单 / 计划委托）：设计上就是等价格穿到触发价才进场，
+      当前价与触发价的差距不构成风险，跳过。
+    - ``LIMIT``：看挂单价与现价的关系。做多挂在**现价之上**会立刻吃掉（
+      等于市价），挂在现价之下就得等回踩；做空对称。只有「等待」那一侧
+      才跳过价差校验。
+
+    取不到现价（``venue_price <= 0``）时返回 ``False``，让调用方保持原有
+    的保守行为。
+    """
+    if order_type == ORDER_TYPE_MARKET:
+        return False
+    if order_type == ORDER_TYPE_TRIGGER:
+        return True
+    if venue_price <= 0 or price <= 0:
+        return False
+    if side == "BUY":
+        return price < venue_price
+    if side == "SELL":
+        return price > venue_price
+    return False
 
 
 def _decide_side(decision: Mapping[str, Any]) -> str:
@@ -302,6 +351,12 @@ class AutoTrader:
         #: 最近一次「突破单触发后补挂保护单」的明细（供上层推送实盘成交回报）。
         #: 只在 resume_pending_trigger 真正补挂成功时被覆盖；None 表示没有新事件。
         self.last_resume_report: dict[str, Any] | None = None
+        #: 补挂失败时的明细（供上层推「保护单没挂上」告警）。只在值得打扰
+        #: 用户的那一刻被写入（首次失败 / 放弃重试），成功一次就清空。
+        self.last_resume_failure: dict[str, Any] | None = None
+        #: order_id → 连续失败次数。用于「重试 N 次后放弃」并避免每 120 秒
+        #: 报一次警（补挂是周期任务，失败会一直重来）。
+        self._resume_fail_counts: dict[str, int] = {}
         self._testnet: bool = bool(opts.get("testnet", False))
         self._demo: bool = bool(opts.get("demo", False))
         self._timeout_s: float = to_float(opts.get("timeout_s"), 10.0)
@@ -436,6 +491,47 @@ class AutoTrader:
             return None
         return (got - base) / base * 10_000.0
 
+    def _held_position(
+        self, client: Any, venue_symbol: str, position_side: str
+    ) -> tuple[float, float]:
+        """查这个方向的**整个持仓** ``(数量, 均价)``；查不到返回 ``(0, 0)``。
+
+        为什么要查：开仓后的保护单必须覆盖「整个仓位」，而不是只覆盖
+        本笔成交。加仓时如果按本笔数量挂止盈，场上会出现「持仓 0.2 ETH、
+        两段止盈加起来只有 0.1 ETH」—— 一半仓位没有止盈（2026-11-14
+        模拟盘实测）。均价同理：几何校验的基准应是整个持仓的成本，
+        不是最后一次成交价，否则止损会被算得比实际更松。
+
+        查询失败一律返回 0，由调用方退回「只用本笔成交」的旧行为。
+        """
+        try:
+            ok, _msg, positions = (
+                client.list_positions()
+                if hasattr(client, "list_positions")
+                else (False, "", [])
+            )
+        except Exception as exc:  # noqa: BLE001 — 查持仓失败不能影响挂保护单
+            logger.debug("AutoTrader 查询持仓失败: %s", exc)
+            return 0.0, 0.0
+        if not ok:
+            return 0.0, 0.0
+        for item in positions or ():
+            if not isinstance(item, dict):
+                continue
+            if not self._position_matches(
+                str(item.get("symbol", "") or ""), venue_symbol
+            ):
+                continue
+            if normalize_position_side(
+                str(item.get("position_side") or position_side)
+            ) != normalize_position_side(position_side):
+                continue
+            size = to_float(item.get("size"), 0.0)
+            avg = to_float(item.get("entry_price"), 0.0)
+            if size > 0:
+                return size, avg
+        return 0.0, 0.0
+
     def _place_protections(
         self,
         client: Any,
@@ -459,6 +555,25 @@ class AutoTrader:
         if not qty or qty <= 0:
             logger.warning("自动交易：成交数量为空，无法挂保护单")
             return ()
+
+        # 保护单要覆盖**整个持仓**：加仓时本笔只成交了一半，若按本笔数量
+        # 挂止盈，剩下那一半就没有止盈；均价也应取整个持仓的成本价。
+        # 查不到持仓（网络抖动 / 现货）时退回本笔成交的旧行为。
+        held_qty, held_avg = self._held_position(
+            client, venue_symbol, position_side
+        )
+        if held_qty > 0:
+            if held_qty > qty + 1e-9:
+                logger.info(
+                    "自动交易：%s 本次成交 %s，累计持仓 %s —— "
+                    "保护单按整个持仓重建",
+                    venue_symbol,
+                    format_decimal(qty),
+                    format_decimal(held_qty),
+                )
+            qty = held_qty
+            if held_avg > 0:
+                entry_price = held_avg
 
         plans = plan_protections(
             position_side=position_side,
@@ -520,6 +635,10 @@ class AutoTrader:
             neutral = self._neutral_symbol(pending.get("symbol", ""))
             if not neutral:
                 return False, ""
+            # 失败计数的键：同一条 pending 记录（order_id 相同）算同一件事。
+            order_key = str(pending.get("order_id") or "") or str(
+                pending.get("ts") or ""
+            )
             plans = pending.get("protection_plan") or []
             if not plans:
                 self._mark_trigger_resumed(pending, "no-plan")
@@ -542,6 +661,7 @@ class AutoTrader:
             held = 0.0
             fill_price = 0.0
             held_symbol = venue_symbol
+            held_side = ""
             for item in positions:
                 raw_symbol = str(item.get("symbol", "") or "")
                 if not self._position_matches(raw_symbol, venue_symbol):
@@ -552,12 +672,27 @@ class AutoTrader:
                 held = to_float(item.get("size"), 0.0)
                 # 实际成交均价：决策价只是触发价，用它做几何校验会误判。
                 fill_price = to_float(item.get("entry_price"), 0.0)
+                # 方向以**交易所持仓**为准，不看流水里的字段：
+                # 2026-11-16 线上事故就是流水把 short 记成了 long，
+                # 补挂时按 long 算术，止损价 1844.52 反而变成「做多止损」，
+                # 交易所直接拒绝（价格与方向矛盾）。持仓方向是唯一权威。
+                raw_side = str(item.get("position_side") or "").strip()
+                # normalize_position_side 对空值也会回落 long，
+                # 所以必须先判空，否则「字段缺失」会被误当成「做多持仓」。
+                held_side = normalize_position_side(raw_side) if raw_side else ""
                 break
             if held <= 0:
                 # 还没成交（或者已经手动平掉）→ 什么都不做
                 return False, ""
 
-            position_side = str(pending.get("position_side") or POSITION_LONG)
+            # 有持仓就听交易所的；拿不到持仓方向（老客户端/字段缺失）
+            # 才退回流水里的记录 —— normalize_position_side 对 None/空串
+            # 会回落 long，所以这里显式区分「没拿到」和「拿到 long」。
+            position_side = (
+                held_side
+                if held_side
+                else str(pending.get("position_side") or POSITION_LONG)
+            )
             if fill_price <= 0:
                 fill_price = to_float(pending.get("trigger_price"), 0.0)
 
@@ -576,15 +711,76 @@ class AutoTrader:
                 position_side=position_side,
                 plans=tuple_plans,
                 market_type=self.market_type,
+                # 补偿场景（成交后才补挂）：场上不应已有保护单，
+                # 若真有也说明是别的路径挂的，不该在这里撤别人的单。
+                replace_on_mismatch=False,
             )
+            total = len(protections)
             ok_count = sum(1 for o in protections if o.ok)
             logger.info(
-                "自动交易：突破单已触发（%s 持仓 %s，成交均价 %s），"
-                "补挂保护单 %d/%d 条",
+                "自动交易：%s（%s 持仓 %s，成交均价 %s），补挂保护单 %d/%d 条",
+                "限价单已成交"
+                if pending.get("pending_fill")
+                else "突破单已触发",
                 held_symbol, format_decimal(held), format_decimal(fill_price),
-                ok_count, len(protections),
+                ok_count, total,
             )
-            self._mark_trigger_resumed(pending, "resumed", protections)
+            if total <= 0 or ok_count <= 0:
+                # 一条都没挂上 = 仓位仍在裸奔。**绝不能**落 trigger-resumed
+                # 标记：那会让 _last_pending_trigger() 把这单当成「已补挂」，
+                # 之后每轮都不再重试，仓位永远没有止损（2026-11-16 事故：
+                # 3/3 全失败也被标记 resumed，事后只是靠人工发现）。
+                attempts = self._resume_fail_counts.get(order_key, 0) + 1
+                self._resume_fail_counts[order_key] = attempts
+                if attempts >= _RESUME_MAX_ATTEMPTS:
+                    # 连续失败达到上限：放弃自动重试并标记，避免无限打接口
+                    # （每次都要查持仓 + 下单，失败通常是权限/参数问题）。
+                    # 保留失败明细给上层推告警，别静默吞掉。
+                    self._mark_trigger_resumed(pending, "gave-up", protections)
+                    self.last_resume_failure = self._resume_failure_payload(
+                        pending,
+                        pending.get("symbol", ""),
+                        held_symbol,
+                        position_side,
+                        fill_price,
+                        held,
+                        protections,
+                        attempts,
+                        final=True,
+                    )
+                    logger.error(
+                        "自动交易：%s 保护单连续 %d 次全部挂失败，已放弃自动重试"
+                        "（仓位裸奔，请立即人工挂止损/止盈）",
+                        held_symbol,
+                        attempts,
+                    )
+                    return False, ""
+                self.last_resume_failure = self._resume_failure_payload(
+                    pending,
+                    pending.get("symbol", ""),
+                    held_symbol,
+                    position_side,
+                    fill_price,
+                    held,
+                    protections,
+                    attempts,
+                    final=False,
+                )
+                logger.warning(
+                    "自动交易：%s 保护单 0/%d 条挂上（第 %d/%d 次），"
+                    "下一轮继续重试",
+                    held_symbol,
+                    total,
+                    attempts,
+                    _RESUME_MAX_ATTEMPTS,
+                )
+                return False, ""
+            # 有腿挂上了 → 记一次成功，清掉失败计数与待报警状态
+            self._resume_fail_counts.pop(order_key, None)
+            self.last_resume_failure = None
+            self._mark_trigger_resumed(
+                pending, "resumed" if ok_count >= total else "partial", protections
+            )
             # 留一份本次补挂的明细给上层做通知（返回值签名保持不变，
             # 已有 7 处调用方按 (handled, message) 解包）。
             self.last_resume_report = {
@@ -656,7 +852,10 @@ class AutoTrader:
                 if oid:
                     resumed_ids.add(oid)
                 continue
-            if not item.get("pending_trigger"):
+            # 两条补偿链路共用同一套「登记 -> 查持仓 -> 补挂」机制：
+            # ``pending_trigger`` 是突破单计划委托，``pending_fill`` 是限价单
+            # 挂出后尚未成交。两者共同点是「记录时还没有持仓」。
+            if not (item.get("pending_trigger") or item.get("pending_fill")):
                 continue
             if pending is None:
                 pending = item
@@ -695,6 +894,68 @@ class AutoTrader:
                 for o in protections
             ]
         self._log_record(record)
+
+    def _resume_failure_payload(
+        self,
+        pending: dict[str, Any],
+        symbol: str,
+        venue_symbol: str,
+        position_side: str,
+        entry_price: float,
+        qty: float,
+        protections: Any,
+        attempts: int,
+        *,
+        final: bool,
+    ) -> dict[str, Any]:
+        """把「保护单一条都没挂上」的现场整理成一个 dict 交给通知层。
+
+        为什么需要它：2026-11-16 线上事故里，限价单成交后三条保护单全被
+        交易所拒掉（51023 Position doesn't exist 等），程序照样写了
+        trigger-resumed 并当成功返回，钉钉一条消息都没有——仓位裸奔
+        近 10 分钟才靠人肉看盘发现。补偿失败必须是一个能推出去的事件，
+        而不只是一行 WARNING 日志。
+
+        只读，不写盘、不下单：真正的流水记录由 _mark_trigger_resumed 负责；
+        这里只是给上层（守护进程 -> 钉钉）一份可读的失败明细。
+        """
+        reasons: list[str] = []
+        items: list[dict[str, Any]] = []
+        for item in protections or ():
+            kind = str(getattr(item, "kind", "") or "")
+            ok = bool(getattr(item, "ok", False))
+            message = str(getattr(item, "message", "") or "").strip()
+            items.append(
+                {
+                    "kind": kind,
+                    "ok": ok,
+                    "trigger_price": getattr(item, "trigger_price", 0.0),
+                    "qty": getattr(item, "qty", 0.0),
+                    "message": message,
+                }
+            )
+            if not ok:
+                label = protection_label(kind)
+                reasons.append(f"{label}: {message}" if message else label)
+        return {
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "kind": "protection-failed",
+            "venue": self.venue,
+            "symbol": symbol or str(pending.get("symbol") or ""),
+            "venue_symbol": venue_symbol,
+            "order_id": str(pending.get("order_id") or ""),
+            "position_side": position_side,
+            "entry_price": entry_price,
+            "qty": qty,
+            "protections": tuple(items),
+            "total": len(items),
+            "reasons": reasons,
+            "attempts": attempts,
+            "first": attempts <= 1,
+            "final": bool(final),
+            "market_type": self.market_type,
+            "margin_mode": self.margin_mode,
+        }
 
     def close(self) -> None:
         """释放底层 HTTP 连接（可重复调用）。"""
@@ -845,6 +1106,9 @@ class AutoTrader:
             "leverage": self.leverage,
             "margin_usdt": 0.0,
             "notional_usdt": 0.0,
+            # 兜底方向：真正的方向要等 Gate 9/10 算出 notional/qty 之后才能
+            # 确定（见下面 record["position_side"] = position_side 那一行）。
+            # 早期拒单分支（Gate 1~8）根本没算方向，这里只能给面板默认值。
             "position_side": self.position_side or POSITION_LONG,
             "margin_mode": self.margin_mode,
             "order_status": _STATUS_SKIPPED,
@@ -936,6 +1200,51 @@ class AutoTrader:
                     )
                 )
 
+            # Gate 4.5 — 保护单几何是否成立（有止损时无条件校验）
+            #
+            # 只在「挂保护单」这一步校验是不够的（2026-11-14 模拟盘实测）：
+            # 做多却给了止损在上方、止盈在下方时，开仓照常成交，三条腿全被
+            # 交易所拒掉 —— 仓位就这么裸奔了，而这恰恰是最该拦住的情况。
+            # 所以在开仓之前就用同一套 plan_protections 判一次。
+            if _has_stop_loss(decision):
+                _probe_side = (
+                    self._resolve_position_side(_decide_side(decision) or "BUY")
+                    if self.market_type == MARKET_FUTURES
+                    else POSITION_LONG
+                )
+                _probe_price = self._entry_price(decision, last_price)
+                if _probe_price > 0:
+                    # 只把「给了价但方向矛盾」算错。缺价（决策没给 TP2）
+                    # 不算矛盾 —— 那种情况只会少挂一条腿，不会裸奔，
+                    # 而且 STAGE2 契约里 TP2 本来就是可选的。
+                    _bad = [
+                        f"{protection_label(kind)}: {problem}"
+                        for kind, _px, _q, problem in plan_protections(
+                            position_side=_probe_side,
+                            entry_price=_probe_price,
+                            stop_loss=decision.get(
+                                "stop_loss_price", decision.get("stop_loss")
+                            ),
+                            take_profit_1=decision.get("take_profit_price"),
+                            take_profit_2=decision.get("take_profit_price_2"),
+                            total_qty=1.0,
+                            tp1_fraction=self.tp1_fraction,
+                        )
+                        if problem and to_float(_px, 0.0) > 0
+                    ]
+                    if _bad:
+                        return finish(
+                            AutoTradeOutcome(
+                                executed=False,
+                                dry_run=self.dry_run,
+                                reason=(
+                                    "invalid-protection: 止盈止损价位与开仓方向"
+                                    "矛盾，开仓后保护单必然挂不上 —— "
+                                    + "；".join(_bad)
+                                ),
+                            )
+                        )
+
             # Gate 5 — 白名单
             neutral = self._neutral_symbol(symbol)
             if not neutral:
@@ -991,23 +1300,64 @@ class AutoTrader:
             # Gate 8 — 跨所价差保护
             # 分析用的行情可能来自另一家交易所（如 Binance 行情 + OKX 下单），
             # 决策价格与下单所真实价格偏离过大时，宁可不下单。
+            #
+            # 但「偏离」的语义只对**会立即成交的单**成立。限价单挂到现价的
+            # 另一侧等回踩/等反弹、突破单等价格穿触发价，这两种差距是策略
+            # 设计的一部分（见 _waits_for_price 的注释与 2026-11-15~16 的
+            # 实测记录），用同一个百分比去卡等于变相禁止挂等待单 —— 所以
+            # 等待单改看「挂单价离现价是否远到离谱」，以风险距离为尺子。
             venue_price = self._venue_reference_price(symbol)
             if self.max_price_deviation_pct > 0 and venue_price > 0:
-                deviation_pct = abs(venue_price - price) / price * 100.0
-                if deviation_pct > self.max_price_deviation_pct:
-                    return finish(
-                        AutoTradeOutcome(
-                            executed=False,
-                            dry_run=self.dry_run,
-                            reason=(
-                                f"price-deviation: 下单所 {self.venue} 最新价 "
-                                f"{format_decimal(venue_price)} 与决策价 "
-                                f"{format_decimal(price)} 偏离 "
-                                f"{deviation_pct:.2f}% > "
-                                f"max_price_deviation_pct={self.max_price_deviation_pct}%"
-                            ),
-                        )
+                if _waits_for_price(order_type, side, price, venue_price):
+                    stop_price = to_float(
+                        decision.get(
+                            "stop_loss_price", decision.get("stop_loss")
+                        ),
+                        0.0,
                     )
+                    risk = abs(price - stop_price) if stop_price > 0 else 0.0
+                    gap = abs(venue_price - price)
+                    if risk > 0 and gap > risk * MAX_PENDING_STOP_MULT:
+                        return finish(
+                            AutoTradeOutcome(
+                                executed=False,
+                                dry_run=self.dry_run,
+                                reason=(
+                                    f"price-deviation-pending: 下单所 {self.venue} "
+                                    f"最新价 {format_decimal(venue_price)} 与等待单"
+                                    f"挂单价 {format_decimal(price)} 相差 "
+                                    f"{format_decimal(gap)}，超过风险距离 "
+                                    f"{format_decimal(risk)} 的 "
+                                    f"{MAX_PENDING_STOP_MULT:g} 倍 —— 决策价可能已失效"
+                                ),
+                            )
+                        )
+                    logger.info(
+                        "自动交易：%s 挂的是等待成交的 %s（挂 %s，现价 %s，"
+                        "相差 %.2f%%），价差护栏不适用，改看风险距离 %.2f 倍上限",
+                        symbol,
+                        order_type,
+                        format_decimal(price),
+                        format_decimal(venue_price),
+                        gap / price * 100.0 if price > 0 else 0.0,
+                        MAX_PENDING_STOP_MULT,
+                    )
+                else:
+                    deviation_pct = abs(venue_price - price) / price * 100.0
+                    if deviation_pct > self.max_price_deviation_pct:
+                        return finish(
+                            AutoTradeOutcome(
+                                executed=False,
+                                dry_run=self.dry_run,
+                                reason=(
+                                    f"price-deviation: 下单所 {self.venue} 最新价 "
+                                    f"{format_decimal(venue_price)} 与决策价 "
+                                    f"{format_decimal(price)} 偏离 "
+                                    f"{deviation_pct:.2f}% > "
+                                    f"max_price_deviation_pct={self.max_price_deviation_pct}%"
+                                ),
+                            )
+                        )
 
             is_futures = self.market_type == MARKET_FUTURES
             # 全仓（cross）没有「每单固定保证金」概念：保证金来自整个账户可用余额，
@@ -1088,6 +1438,12 @@ class AutoTrader:
                 else None
             )
             position_side = self._resolve_position_side(side) if is_futures else POSITION_LONG
+            # 流水里的方向必须是**本次决策**的方向。面板没指定方向时
+            # （self.position_side 为空=跟随决策）上面初始化会落到
+            # POSITION_LONG，于是做空的单子在流水里被记成 long；事后
+            # resume_pending_trigger() 就是按这行去挂保护单的，方向一反，
+            # 止损/止盈全部挂到反向，交易所直接拒绝（2026-11-16 线上事故）。
+            record["position_side"] = position_side
 
             # 试运行也要展示「开仓后会挂哪几条保护单」，否则用户没法在
             # dry_run 阶段确认止盈止损价位是否会被正确提交。
@@ -1300,6 +1656,45 @@ class AutoTrader:
                         margin_usdt=round(margin_usdt, 8),
                     ),
                     message=f"计划委托已挂，等待触发（触发价 {format_decimal(to_float(order_price, 0.0))}）",
+                )
+
+            # 限价单只是挂上去，此刻还没有持仓（交易所回 state=live、
+            # accFillSz=0）。这时去挂保护单，交易所必然报「没有持仓」，
+            # 三条腿全失败；而限价单几分钟后成交时，之前**没有任何东西**
+            # 会回来补挂 —— 仓位就这么裸奔（2026-11-14 模拟盘实测）。
+            # 所以这里和计划委托走同一条补偿链路：先登记，成交后由
+            # resume_pending_trigger() 查持仓再补挂。
+            if not bool(getattr(result, "filled", True)):
+                record["pending_fill"] = True
+                record["trigger_price"] = to_float(order_price, 0.0)
+                record["protection_plan"] = [
+                    {
+                        "kind": kind,
+                        "trigger_price": trigger,
+                        "qty": leg_qty,
+                        "problem": problem,
+                    }
+                    for kind, trigger, leg_qty, problem in planned_protections
+                ]
+                logger.info(
+                    "自动交易：%s 限价单已挂但尚未成交（ordId=%s），"
+                    "成交后下一轮再补挂保护单",
+                    venue_symbol,
+                    getattr(result, "order_id", "") or "—",
+                )
+                return finish(
+                    AutoTradeOutcome(
+                        executed=True,
+                        dry_run=False,
+                        reason="pending-fill",
+                        result=result,
+                        leverage=leverage,
+                        notional_usdt=round(notional, 8),
+                        margin_usdt=round(margin_usdt, 8),
+                    ),
+                    message=(
+                        "限价单已挂出，等待成交（成交后自动补挂止损/止盈）"
+                    ),
                 )
 
             # 开仓已成交 → 立刻把止损 / TP1 / TP2 挂到交易所侧。

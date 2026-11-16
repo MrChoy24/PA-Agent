@@ -308,6 +308,31 @@ def _is_nvidia(base_url: str) -> bool:
     return "nvidia.com" in (base_url or "").lower()
 
 
+def _is_siliconflow(base_url: str) -> bool:
+    """硅基流动 (api.siliconflow.cn) OpenAI-compatible gateway.
+
+    2026-11 实测（deepseek-ai/DeepSeek-V4-Flash）：
+      - ``max_tokens`` 到 384000 都 200，无需限流；
+      - 接受 ``thinking.type=adaptive`` + ``output_config.effort``；
+      - **流式 delta 只有 ``content`` / ``role``，永不出
+        ``reasoning_content``** —— 即使明说在想。所以下面「思考内容过短」
+        的告警在这个网关下是必然误报，必须排除，否则每轮分析刷一条。
+        注意：不传 thinking 时正文会把思考尾巴漏成 ``200</think>200``，
+        但那是**非流式**的行为；项目走 stream_chat，正文干净。
+    """
+    return "siliconflow.cn" in (base_url or "").lower()
+
+
+def _provider_returns_reasoning(settings: AIProviderSettings) -> bool:
+    """该网关是否会把思考内容放在 ``reasoning_content`` 里回传。
+
+    目前只有硅基流动明确**不**回传（见 ``_is_siliconflow`` 的实测记录）。
+    别的网关保持原行为 —— 宁可多一条告警，也不要漏掉「思考没生效」
+    这种能解释正文质量问题的信号。
+    """
+    return not _is_siliconflow(settings.base_url)
+
+
 # Packy claude-officially returns 400 if max_tokens exceeds model output cap.
 _PACKY_CLAUDE_MAX_OUTPUT_TOKENS = 128_000
 # DeepSeek API: max_tokens must be in [1, 393216].
@@ -1097,7 +1122,14 @@ class DeepSeekClient:
                 self._settings.base_url,
             )
         from pa_agent.ai.glm_flash_lite import is_glm_flash
-        if _thinking_on and len(reasoning_content) < 80 and not is_glm_flash(self._settings):
+        # 注意 _provider_returns_reasoning：硅基流动的流式响应根本不带
+        # reasoning_content，真去告警就是每轮一条必然误报（实测 21 条/天）。
+        if (
+            _thinking_on
+            and len(reasoning_content) < 80
+            and not is_glm_flash(self._settings)
+            and _provider_returns_reasoning(self._settings)
+        ):
             self._log.warning(
                 "Thinking enabled but reasoning_content is very short (%d chars). "
                 "For KKAI/Claude use reasoning_effort (not DeepSeek extra_body); "

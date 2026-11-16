@@ -756,6 +756,11 @@ class DaemonRunner:
             if trader._last_pending_trigger() is None:
                 return
             handled, message = trader.resume_pending_trigger()
+            # 失败告警优先：保护单一条都没挂上时，那句「已补挂」的成功日志
+            # 根本不该打出来（2026-11-16 事故里正是它掩盖了裸奔仓位）。
+            failure = getattr(trader, "last_resume_failure", None)
+            if failure:
+                self._notify_protection_failure(trader)
             if handled:
                 logger.info("自动交易：突破单触发后已补挂保护单（%s）", message)
                 self._notify_trigger_resumed(trader)
@@ -830,6 +835,28 @@ class DaemonRunner:
             )
         except Exception as exc:  # noqa: BLE001 - 通知失败不影响主循环
             logger.warning('突破单成交回报推送异常（忽略）：%s', exc)
+
+    def _notify_protection_failure(self, trader) -> None:
+        """成交了但保护单没挂上时推一条裸奔告警（绝不抛异常）。
+
+        ``trader.last_resume_failure`` 由 ``resume_pending_trigger()`` 在
+        「0 条挂成功」时写入，成功补挂后会清空 —— 所以这里只要有值就说明
+        当前确实有一笔仓位没有止损。同一条 pending 记录连续失败时每轮只推
+        一次（``attempts`` 递增，达到上限那次带「已放弃重试」）。
+        """
+        try:
+            report = getattr(trader, "last_resume_failure", None)
+            if not report:
+                return
+            from pa_agent.notify.trade_report import notify_protection_failure
+
+            notify_protection_failure(
+                report,
+                settings=self._cfg.settings,
+                venue=str(self._auto_trade_options().get("venue") or ""),
+            )
+        except Exception as exc:  # noqa: BLE001 - 通知失败不影响主循环
+            logger.warning("保护单失败告警推送异常（忽略）：%s", exc)
 
     # ── health ───────────────────────────────────────────────────────────────
 

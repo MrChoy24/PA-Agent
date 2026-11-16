@@ -272,6 +272,77 @@ def test_trigger_resumed_report_ignores_empty_report(captured):
     assert captured == []
 
 
+# ── 保护单未挂上：裸奔告警 ────────────────────────────────────────────────────
+def _failure_report(**overrides):
+    report = {
+        "symbol": "ETH-USDT-SWAP",
+        "venue": "okx",
+        "order_id": "4095",
+        "position_side": "short",
+        "entry_price": 1819.47,
+        "qty": 0.82,
+        "attempts": 1,
+        "final": False,
+        "total": 3,
+        "reasons": ["止损: 51023 Position doesnt exist", "TP1: 51279 invalid"],
+        "protections": (
+            ProtectionOrder(kind=PROTECT_STOP_LOSS, trigger_price=1844.52,
+                            qty=0.82, message="51023 Position doesnt exist"),
+        ),
+    }
+    report.update(overrides)
+    return report
+
+
+def test_protection_failure_is_pushed_with_exchange_reasons(captured):
+    """成交了但一条保护单都没挂上，必须推一条带交易所原因的告警。"""
+    assert trade_report.notify_protection_failure(_failure_report(), venue="okx") is True
+
+    body = _body(captured)
+    assert "保护单未挂上" in body
+    assert "ETH-USDT-SWAP" in body
+    assert "做空" in body
+    assert "51023" in body, "交易所拒绝原因必须原样带出"
+    assert "第 1 次" in body
+    assert "下一轮继续重试" in body
+
+
+def test_protection_failure_final_asks_for_manual_action(captured):
+    """达到重试上限的告警要说清「已放弃」，并明确要求人工介入。"""
+    ok = trade_report.notify_protection_failure(
+        _failure_report(final=True, attempts=3), venue="okx"
+    )
+
+    assert ok is True
+    body = _body(captured)
+    assert "已放弃自动重试" in body
+    assert "人工" in body
+
+
+def test_protection_failure_ignores_empty_report(captured):
+    assert trade_report.notify_protection_failure(None) is False
+    assert trade_report.notify_protection_failure({}) is False
+    assert captured == []
+
+
+def test_protection_failure_skips_when_notifier_disabled(captured, monkeypatch):
+    monkeypatch.setattr(
+        dingtalk_notifier, "dingtalk_is_active", lambda settings=None: False
+    )
+    assert trade_report.notify_protection_failure(_failure_report()) is False
+    assert captured == []
+
+
+def test_protection_failure_never_raises(monkeypatch):
+    def boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(dingtalk_notifier, "send_markdown", boom)
+    monkeypatch.setattr(
+        dingtalk_notifier, "dingtalk_is_active", lambda settings=None: True
+    )
+    assert trade_report.notify_protection_failure(_failure_report()) is False
+
 def test_short_side_is_labelled():
     _, body = dingtalk_notifier._build_trade_markdown(
         venue="binance",
