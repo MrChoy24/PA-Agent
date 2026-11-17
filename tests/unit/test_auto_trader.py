@@ -457,3 +457,16 @@ def test_isolated_margin_below_cap_is_untouched(log_path: Path) -> None:
     assert raw["notional_usdt"] == pytest.approx(10.0)
     assert raw["margin_usdt"] == pytest.approx(1.0)
     assert raw["clamped"] is False
+
+
+def test_position_side_follows_the_order_direction_not_the_panel() -> None:
+    """O6：面板配「做多」而本次决策做空时，流水必须记 short。
+
+    补偿链路按流水里的 position_side 给新仓挂保护单；方向记反了，
+    止损/止盈会挂到反向，OKX 回 51280 / 51279 拒单，仓位裸奔。
+    """
+    trader = AutoTrader(_opts(), venue="okx")
+    trader.position_side = "long"
+
+    assert trader._resolve_position_side("SELL") == "short"
+    assert trader._resolve_position_side("BUY") == "long"

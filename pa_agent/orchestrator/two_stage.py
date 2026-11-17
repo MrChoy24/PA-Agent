@@ -1230,7 +1230,14 @@ class TwoStageOrchestrator:
                     "stage2_messages": messages_s2,
                     "strategy_files_used": strategy_files,
                     "experience_loaded": _exp_loaded,
-                    "usage_total": _accumulate_usage(record.usage_total, reply_s1.usage),
+                    # 2026-11-17 审计 P2-8：这一分支只累加了主调用一份 usage，
+                    # 把 stage1/stage2 备用链路上已发生的调用（s1_usage_calls /
+                    # s2_usage_calls）全丢了 —— 账号额度统计会少算，用户看到
+                    # 「这轮很便宜」而实际已经烧掉几轮。与 1262 行分支统一。
+                    "usage_total": _accumulate_usage_calls(
+                        _accumulate_usage_calls(record.usage_total, s1_usage_calls),
+                        s2_usage_calls,
+                    ),
                     "exception": self._sensenova_fallback_exception_fields(
                         primary_type=s2_primary_error_type,
                         primary_message=str(s2_primary_error),
@@ -1466,8 +1473,32 @@ class TwoStageOrchestrator:
                 category="c", stage="stage2", raw_text=content,
                 message=f"free fallback unrecoverable: {getattr(result, 'message', '')}",
             )
+        # 2026-11-17 审计 P0-1：salvage 之后**必须**过归一化，不能直接 Ok。
+        # `salvage_stage2()` 的 entry_price / stop_loss_price / take_profit_price
+        # 全是从正文里正则抽出来的数字，order_direction 由 direction 推导
+        # （bearish→做空，其余一律做多），并且它自己写 terminal.outcome="wait"
+        # 却保留 order_type=限价单 —— 唯一能把它纠正成「不下单」的
+        # `_coerce_decision_no_order` 就在 normalizer 里。旧实现跳过归一化，
+        # 这条 salvage 结果会一路进到 runner 的 _has_order()，再被
+        # auto_trader._entry_price() 当成限价单价真下单：用模型正文里随手
+        # 一个数字开仓。归一化失败按原有语义降级（返回 ValidationError）。
+        try:
+            salvaged = self._validator.normalize_parsed(
+                "stage2", salvaged, **self._relaxed_kwargs("stage2")
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Free fallback stage2 salvage normalize failed: %s", exc
+            )
+            return ValidationError(
+                category="c", stage="stage2", raw_text=content,
+                message=(
+                    "free fallback unrecoverable: "
+                    f"{getattr(result, 'message', '')}"
+                ),
+            )
         logger.warning(
-            "Free fallback stage2 rebuilt from raw text (strict: %s)",
+            "Free fallback stage2 rebuilt from raw text and normalized (strict: %s)",
             getattr(result, "message", "")[:200],
         )
         return Ok(obj=salvaged)
@@ -1840,6 +1871,11 @@ class TwoStageOrchestrator:
                         self._pending_free_meta = recovered[2]
                         return reply_free
                     logger.debug("%s 备用链路只有本地兜底，改用主模型", stage_label)
+                    # 2026-11-17 审计 P2-7：这一轮等于没跑通，把提前置位的
+                    # tried 回滚，让主模型失败后的 Layer 0b（:1937 的
+                    # `not free_lane_state.get("tried")`）还有一次 spare
+                    # channel 机会；否则这条兜底在本轮永远不会被再尝试。
+                    free_lane_state["tried"] = False
             if lite:
                 from pa_agent.ai.glm_flash_lite import build_messages, local_diagnosis
                 if frame is None:
@@ -1847,6 +1883,11 @@ class TwoStageOrchestrator:
                 stage = "stage1" if stage_label == "Stage 1" else "stage2"
                 # Mutate the audit list too: record what was actually sent,
                 # including when the primary failed midway through this call.
+                # 原地覆写是为了让审计记录里保存「实际发出去的那份」提示词
+                # （lite 精简版）——tests/unit/test_glm_flash_lite.py 的
+                # test_midcall_primary_failure_changes_contract 与
+                # test_whole_pipeline_switch_at_stage2 明确断言了这一点。
+                # 审计 P2-11 曾把这当成缺陷，复核后判定为预期语义，保持不变。
                 messages[:] = build_messages(frame, stage)
                 if stage == "stage1":
                     import json
@@ -2037,6 +2078,7 @@ class TwoStageOrchestrator:
                     swap_exc,
                 )
                 continue
+            previous_provider = self._active_provider
             self._active_provider = cand
             # 换上去之后先假定可用：真跑挂了会在下一轮再次 mark_failed。
             # 这样一条已恢复的通道能立刻回到链路前部。
@@ -2045,9 +2087,15 @@ class TwoStageOrchestrator:
             fallback_health.mark_ok(cand)
             # 同一网关内换模型（如方舟额度用完换下一个）仍是同一套协议，
             # 内部实现细节：不输出渠道信息。
+            # 2026-11-17 审计 P2-12：旧实现拿 settings.json 里的「主通道」
+            # 当基线比较，一旦之前已经降级过一次，settings.provider 就不再是
+            # 当前在用的通道，判出来的 same_gateway 是错的 → 误判「仍是同一
+            # 网关」而继续保持 strict 校验（或反过来把同网关当跨网关）。
+            # 基线必须是替换前真正在用的那个 provider。
+            baseline_provider = previous_provider or self._settings.provider
             same_gateway = (
                 str(getattr(cand, "base_url", "") or "").strip()
-                == str(getattr(self._settings.provider, "base_url", "") or "").strip()
+                == str(getattr(baseline_provider, "base_url", "") or "").strip()
             )
             self._on_fallback_provider = not same_gateway
             return True
@@ -2075,6 +2123,11 @@ class TwoStageOrchestrator:
             return False
 
         self._client.update_provider(self._settings.provider)
+        # 2026-11-17 审计 P1-4：连接器降级换的是另一套网关，必须置位
+        # _on_fallback_provider，否则 _s1_validation_settings() 仍按主通道
+        # 的 strict 规则重试，降级后格式差异会被判成校验失败而白烧调用。
+        self._on_fallback_provider = True
+        self._active_provider = self._settings.provider
         self._persist_provider_switch(
             "QClaw", lambda: save_settings(self._settings, SETTINGS_JSON_PATH)
         )
@@ -2109,6 +2162,9 @@ class TwoStageOrchestrator:
             return False
 
         self._client.update_provider(self._settings.provider)
+        # 同 QClaw：连接器降级按备用通道处理（审计 P1-4）。
+        self._on_fallback_provider = True
+        self._active_provider = self._settings.provider
         self._persist_provider_switch(
             "WorkBuddy", lambda: save_settings(self._settings, SETTINGS_JSON_PATH)
         )
@@ -2145,6 +2201,9 @@ class TwoStageOrchestrator:
             return False
 
         self._client.update_provider(self._settings.provider)
+        # 同 QClaw：连接器降级按备用通道处理（审计 P1-4）。
+        self._on_fallback_provider = True
+        self._active_provider = self._settings.provider
         self._persist_provider_switch(
             "TRAE Work CN", lambda: save_settings(self._settings, SETTINGS_JSON_PATH)
         )

@@ -30,6 +30,13 @@ sz 单位       基础币数量                   **张数**（= 基础币 / ctV
 换算结果低于 ``minSz`` 时返回 0 由调用方拒单（**绝不向上兜底到 1 张**，
 那会让名义金额成倍放大）。
 
+持仓接口的 ``size`` 同一套单位：:meth:`OKXTrader.get_positions` 把交易所返回的
+「张数」乘 ``ctVal × ctMult`` 换算成**基础币数量**再给出，与
+:class:`~pa_agent.trading.binance_trader.BinanceTrader` 的同名字段语义一致 ——
+上层 ``AutoTrader._held_position`` 不区分交易所，只认「基础币」。原始张数放在
+``contracts`` 字段里备查。**2026-11-17 线上事故就是这里把 0.82 张当成 0.82 ETH**，
+于是保护单算出 8.2 张（放大 10 倍）；同名字段单位不同是最难查的一类 bug。
+
 Usage:
     trader = OKXTrader(api_key="...", api_secret="...", passphrase="...")
     ok, msg = trader.test_connection()
@@ -127,6 +134,31 @@ def _per_contract(rules: dict[str, Any]) -> float:
 _DEFAULT_MIN_NOTIONAL = 5.0
 
 _HOST_LEVEL_STATUS = (403, 418, 429, 451, 500, 502, 503, 504)
+
+# 止损腿首选 closeFraction=1「全平」语义；只有交易所明确拒绝该参数时才
+# 退回固定张数。2026-11-17 线上事实修正：双向持仓（long_short_mode）下
+# closeFraction=1 是**可用**的 —— 用户手工挂的空头止损
+# algoId=4105589904721682432（posSide=short、sz 为空、closeFraction=1、
+# reduceOnly=true、tdMode=cross）在实盘一直 live。所以原先「双向持仓就
+# 直接退回固定 sz」的前置判断不再成立，改成运行期回退：先按全平挂，
+# 只有 OKX 明确以这些错误码拒绝该参数时才用固定张数重试。
+#   51329 该持仓模式下不支持 closeFraction
+#   50024 sz 与 closeFraction 同时给
+#   51000 closeFraction 取值非法（只接受 1）
+#   51327 非合约（closeFraction 仅限 SWAP）
+#   51328 未带 reduceOnly
+_CLOSE_FRACTION_REJECT_CODES = frozenset({"51329", "50024", "51000", "51327", "51328"})
+#: 同方向已存在止损条件单（OKX 51088）：想换触发价必须先撤旧的那条。
+_STOP_LOSS_CONFLICT_CODE = "51088"
+#: 保证金模式（tdMode）与持仓不一致时 OKX 回的码：51023 持仓不存在、
+#: 51169 该持仓模式下不支持此操作。实例的 _margin_mode 与持仓真实 mgnMode
+#: 不一致时（GUI / 诊断脚本没走 env 覆盖就会这样）挂保护单必被拒，这里按
+#: 相反模式重试一次自愈 —— 2026-11-17 线上新仓一条保护单都没挂上就是这个。
+_MARGIN_MODE_REJECT_CODES = frozenset({"51023", "51169"})
+#: posSide 与账户真实持仓模式不一致：净持仓下多传 posSide 会被 51010 拒。
+#: 持仓模式查询失败 / 缓存过期时这里会按 long_short 发，保护单一条都挂不上；
+#: 收到 51010 就去掉 posSide 重试一次，并把缓存纠正为 net（2026-11-17 自检 O6）。
+_POSSIDE_REJECT_CODE = "51010"
 
 # 持仓模式：双向持仓必须传 posSide，净持仓（net）传了会报 51010
 _POS_MODE_LONG_SHORT = "long_short_mode"
@@ -519,8 +551,23 @@ class OKXTrader:
                 signed=True,
             )
             if payload is None:
-                logger.debug("OKX 查询委托状态失败（%s/%s）: %s", inst_id, ord_id, err)
-                return info
+                # 不能直接 return：一次网络抖动就会让调用方拿到空 state，
+                # 而「空 state」在旧逻辑里等于「已成交」——2026-11-17 线上
+                # 就是这样把一笔从未成交的限价单当成成交，给旧仓补挂了
+                # 保护单还推了成交回报。既然本函数本来就设计了 3 次重试，
+                # 网络失败也应该重试，而不是只对「查到了但没成交」重试。
+                logger.debug(
+                    "OKX 查询委托状态失败（%s/%s，第 %d/%d 次）: %s",
+                    inst_id,
+                    ord_id,
+                    attempt + 1,
+                    retries,
+                    err,
+                )
+                if attempt + 1 < retries:
+                    time.sleep(delay)
+                    delay *= 2
+                continue
             for item in payload.get("data", ()) or ():
                 if not isinstance(item, dict):
                     continue
@@ -723,8 +770,15 @@ class OKXTrader:
         return True, mode, f"OKX 持仓模式：{mode}"
 
     def _is_long_short_mode(self) -> bool:
-        """True only when the account is confirmed in ``long_short_mode``."""
+        """True only when the account is confirmed in ``long_short_mode``.
+
+        2026-11-17 自检（O6）：缓存没读到时再强制重读一次。一次网络抖动
+        不该把双向持仓账户当成净持仓 —— 那样发出去的条件单会漏掉 posSide，
+        OKX 直接拒，止损/止盈一条都挂不上。
+        """
         ok, mode, msg = self.get_position_mode()
+        if not ok:
+            ok, mode, msg = self.get_position_mode(refresh=True)
         if not ok:
             logger.warning(
                 "OKX 持仓模式未知（%s），按 net 模式处理（不传 posSide）", msg
@@ -801,9 +855,21 @@ class OKXTrader:
         """列出 SWAP 持仓 ``(ok, message, positions)``。
 
         对应 ``GET /api/v5/account/positions?instType=SWAP``，过滤掉
-        ``pos == 0`` 的空仓。每项精简为：
-        ``{"symbol","position_side","size","entry_price","mark_price",
-        "unrealized_pnl","leverage","margin"}``（字段与 Binance 版对齐）。
+        ``pos == 0`` 的空仓。每项字段：
+        ``{"symbol","position_side","size","contracts","per_contract",
+        "entry_price","mark_price","unrealized_pnl","leverage","margin"}``。
+
+        **``size`` 的单位是「基础币」（ETH / BTC …），与 Binance 版完全一致。**
+        OKX 返回的 ``pos`` 本身是「张数」，这里乘 ``ctVal × ctMult`` 换算过去；
+        原始张数留在 ``contracts`` 里，排查时可以直接和交易所对账。
+
+        为什么要换算：``AutoTrader._held_position()`` 拿 ``size`` 当基础币用，
+        再交给 ``place_protections()`` 的 ``_contracts_for()`` 除以 ``ctVal``。
+        若这里返回张数，等于乘了两遍 —— 2026-11-17 线上持仓 0.82 张挂出
+        ``sz=8.2`` 的止损 / ``sz=4.1`` 的两段止盈，放大 10 倍。
+
+        拿不到合约面值（instruments 接口失败 / 未收录）时 ``size`` 返回 0：
+        调用方会退回「只按本笔成交数量挂保护单」，这比拿错数量下单安全。
         """
         if not self._has_credentials():
             return False, "未填写 OKX API Key/Secret/Passphrase", []
@@ -826,16 +892,38 @@ class OKXTrader:
                 side = raw_side
             else:  # net 模式返回 net，用数量正负判断
                 side = POSITION_LONG if pos > 0 else POSITION_SHORT
+            inst_id = str(item.get("instId", ""))
+            contracts = abs(pos)
+            per_contract = _per_contract(self._instrument_rules(inst_id, "SWAP"))
+            if per_contract > 0:
+                size = contracts * per_contract
+            else:
+                size = 0.0
+                logger.warning(
+                    "OKX 持仓 %s 拿不到合约面值 ctVal，无法把 %s 张换算成基础币；"
+                    "本次 size 返回 0，保护单只会按本笔成交数量挂",
+                    inst_id,
+                    format_decimal(contracts),
+                )
             out.append(
                 {
-                    "symbol": str(item.get("instId", "")),
+                    "symbol": inst_id,
                     "position_side": side,
-                    "size": abs(pos),
+                    # 基础币数量（与 BinanceTrader 同名字段语义一致）
+                    "size": size,
+                    # 交易所原始张数，仅用于对账与日志
+                    "contracts": contracts,
+                    # 每张面值（ctVal × ctMult），0 = 未知
+                    "per_contract": per_contract,
                     "entry_price": to_float(item.get("avgPx")),
                     "mark_price": to_float(item.get("markPx")),
                     "unrealized_pnl": to_float(item.get("upl")),
                     "leverage": int(to_float(item.get("lever"), 1.0)),
                     "margin": to_float(item.get("margin") or item.get("imr")),
+                    # 该仓真实使用的保证金模式。挂保护单时 tdMode 必须与它
+                    # 一致，否则 OKX 回 51023 Position doesn't exist ——
+                    # 2026-11-17 线上就是这么让新仓一条保护单都没挂上。
+                    "margin_mode": str(item.get("mgnMode") or "").strip().lower(),
                 }
             )
         return True, f"OKX 持仓 {len(out)} 个", out
@@ -1207,8 +1295,19 @@ class OKXTrader:
         if fill_price <= 0:
             fill_price = order_price if order_price > 0 else ref_price
         fill_state = str(fill_info.get("state") or "")
+        # 「查不到状态」绝不能当成「已成交」：2026-11-17 04:10 那笔 buy
+        # 限价单（1816.42）一直 state=live、accFillSz=0，而查单因为 instId
+        # 用的是现货 id（51603）拿不到状态，旧逻辑 (not fill_state) 直接
+        # 判 filled=True → 上层立刻去挂保护单，挂到的是账户里**上一笔**
+        # 多头仓上，止盈 5 秒后把旧仓平了，钉钉还推了「已成交」。
+        #
+        # 所以只有两种情况可以认为成交：
+        #   · 市价/触发类（非 limit）—— 失败会走 sCode 分支，到不了这里；
+        #   · limit 但交易所明确回 filled 或 accFillSz>0。
+        # 其余（live / partially_filled / 空）一律 filled=False，交给
+        # pending_fill + resume_pending_trigger() 后续补挂。
         filled = (type_l != "limit") or fill_state == "filled" or (
-            not fill_state
+            to_float(fill_info.get("fill_sz"), 0.0) > 0
         )
 
         scope = "合约" if is_futures else "现货"
@@ -1350,12 +1449,16 @@ class OKXTrader:
 
         # 止损腿用「全平」语义：closeFraction=1 平掉触发那一刻的全部剩余持仓。
         # 固定 sz 在分批止盈后会「多」出来 —— 开 0.4 张、TP1 成交 0.2 张后
-        # 持仓只剩 0.2 张，止损单却仍写 sz=0.4（2026-11-14 模拟盘实测确认），
-        # 于是触发时一次全平，本来打算留着的后半段敞口提前没了。
-        # 约束（同样实测）：sz 与 closeFraction 互斥（50024）、只接受 1
-        # （0.5 报 51000）、必须配 reduceOnly（51328）、仅限合约（51327）、
-        # 双向持仓模式不可用（51329）→ 那种情况退回收敛到计划量的固定 sz。
-        sl_use_close_fraction = not self._is_long_short_mode()
+        # 持仓只剩 0.2 张，止损单却仍写 sz=0.4，触发时一次全平，本来打算
+        # 留着的后半段敞口提前没了；反过来加仓后固定 sz 又会偏小。
+        # 约束：sz 与 closeFraction 互斥（50024）、只接受 1（0.5 报 51000）、
+        # 必须配 reduceOnly（51328）、仅限合约（51327）。
+        #
+        # 2026-11-17 修正：原先这里写成 not self._is_long_short_mode()，
+        # 导致双向持仓账户一律退回固定张数 —— 但实盘已证明 closeFraction=1
+        # 在 long_short_mode + posSide 下可用，所以改成「一律先按全平挂」，
+        # 交易所真拒绝时在发送处按 _CLOSE_FRACTION_REJECT_CODES 回退。
+        sl_use_close_fraction = True
 
         # 幂等 + 重建：先查一次在挂条件单，再和本次想挂的价位比对。
         #
@@ -1382,9 +1485,33 @@ class OKXTrader:
             tol = tick / 2 if tick > 0 else 1e-9
             return abs(a - b) <= tol
 
+        def _tp_covers(row: dict, price: float, contracts: float) -> bool:
+            """场上这条止盈是否**既同价、又够量**地覆盖了本次要挂的腿。
+
+            只看价位是不够的：加仓后持仓翻倍、价位没变，旧的两条止盈
+            仍是加仓前的张数，于是「持仓 0.2 张、止盈只覆盖 0.1 张」——
+            2026-11-17 模拟盘实测就是这个结果（一半仓位没有止盈）。
+            所以张数不够时必须把旧单撤掉按新量重挂。
+
+            旧单没有 sz（个别夹具 / 历史固定张数单）时按「已覆盖」处理：
+            宁可少撤一次，也不要因为字段缺失就无谓重建、留出空窗。
+            """
+            if not _px_close(to_float(row.get("tpTriggerPx"), 0.0), price):
+                return False
+            have = to_float(row.get("sz"), 0.0)
+            return have <= 0 or have + 1e-9 >= contracts
+
+        # 认「任何一条同方向的止损腿」，不再只看 closeFraction=1 的那条。
+        # 否则双向持仓账户里历史遗留的固定 sz 止损不参与比对：价不一致时
+        # 撤不掉它（新旧两条止损并存，第二条被 51088 拒），价一致时又会
+        # 重复尝试挂单。判断依据是 slTriggerPx 非空（closeFraction 止损
+        # 也带 slTriggerPx），额外认 closeFraction=1 只是为了兜住个别夹具。
         existing_sl_rows = [
             r for r in existing
-            if _same_side(r) and str(r.get("closeFraction") or "") == "1"
+            if _same_side(r) and (
+                str(r.get("slTriggerPx") or "").strip()
+                or str(r.get("closeFraction") or "") == "1"
+            )
         ]
         existing_tp_rows = [
             r for r in existing
@@ -1400,27 +1527,20 @@ class OKXTrader:
             ),
             0.0,
         )
-        want_tps = [
-            to_float(p, 0.0)
-            for k, p, _q, pb in plans
+        # 每条止盈腿「想挂的张数」：重建判断除了价位还要看量（见 _tp_covers）。
+        want_tp_legs = [
+            (to_float(p, 0.0), self._contracts_for(to_float(q, 0.0), rules))
+            for k, p, q, pb in plans
             if k in (PROTECT_TAKE_PROFIT_1, PROTECT_TAKE_PROFIT_2) and not pb
         ]
 
         have_sl_px = [
             to_float(r.get("slTriggerPx"), 0.0) for r in existing_sl_rows
         ]
-        have_tp_px = [to_float(r.get("tpTriggerPx"), 0.0) for r in existing_tp_rows]
-
         sl_matches = (
-            bool(sl_use_close_fraction)
-            and want_sl > 0
+            want_sl > 0
             and len(have_sl_px) == 1
             and _px_close(have_sl_px[0], want_sl)
-        )
-        tp_matches = (
-            bool(want_tps)
-            and len(have_tp_px) == len(want_tps)
-            and all(any(_px_close(w, h) for h in have_tp_px) for w in want_tps)
         )
 
         # 加仓场景（真实缺陷，2026-11-14 模拟盘实测）：第二次开仓后持仓翻倍、
@@ -1439,12 +1559,15 @@ class OKXTrader:
                 to_cancel.extend(existing_sl_rows)
             # 止盈：本次想挂的价位逐条在场上找，找到就保留，找不到的旧单撤掉。
             keep_tp_px: set[float] = set()
-            if want_tps:
-                remaining = list(want_tps)
+            if want_tp_legs:
+                # 逐条按「同价 + 够量」匹配：同价但张数不足的旧单必须撤掉
+                # 按新量重挂，否则加仓后止盈只覆盖一半仓位。
+                remaining = list(want_tp_legs)
                 for row in existing_tp_rows:
                     px = to_float(row.get("tpTriggerPx"), 0.0)
                     hit = next(
-                        (w for w in remaining if _px_close(w, px)), None
+                        (leg for leg in remaining if _tp_covers(row, leg[0], leg[1])),
+                        None,
                     )
                     if hit is None:
                         to_cancel.append(row)
@@ -1460,22 +1583,47 @@ class OKXTrader:
             existing_sl_all = matched_sl
             existing_tp_prices = keep_tp_px
         else:
-            # 调用方明确要求「只补不改」时退回旧的纯幂等语义：
-            # 场上已有全平止损就跳过，已有同价止盈就跳过。
-            existing_sl_all = bool(existing_sl_rows)
+            # 调用方明确要求「只补不改」：不撤任何在挂单，但**仍然按价位判断**。
+            #
+            # 曾经这里写成 bool(existing_sl_rows) —— 只要场上有任何一条同方向
+            # 止损就整体跳过，于是「上一笔仓位留下的旧止损」会把新仓位的止损
+            # 顶掉：2026-11-17 线上，多头新仓要挂 1808.70 的止损，场上还挂着
+            # 上一笔的 1809.18，代码回一句「同价位已有止损条件单在场」就
+            # 当成挂好了，新仓实际一条止损都没有（后来靠人工补挂）。
+            # 价位不一致 = 没有覆盖本仓，必须照常挂；价位一致才是真幂等。
             existing_tp_prices = {
                 to_float(r.get("tpTriggerPx"), 0.0) for r in existing_tp_rows
             }
+            # 价位不一致的旧止损**不在这里撤**：真撤了，而新止损又挂失败，
+            # 仓位就彻底没保护了。留给挂单被 51088（同方向止损已存在）拒掉
+            # 之后再「撤旧重挂」一次，见下面的重试分支。
+            existing_sl_all = sl_matches if want_sl > 0 else bool(existing_sl_rows)
 
-        def _tp_already_exists(price: float) -> bool:
+        def _tp_already_exists(price: float, contracts: float = 0.0) -> bool:
             """触发价是否已有一条止盈单。
 
             用容差而不是 ``==``：交易所回显的是**按 tick 取整后**的价格
             （例如计划写 2010.005、tick=0.01 时回显 2010.0），直接比浮点数
             会漏判，于是又叠一条。容差取 tick 的一半，够覆盖取整误差。
+
+            ``contracts`` > 0 且场上那条同价止盈的张数不足时，仍然算「在场」
+            （只补不改的分支不撤单，重复挂同价止盈会叠出一倍量），但会打一条
+            WARNING 把「加仓后止盈没跟上」这件事留痕 —— 正常开仓路径走的是
+            replace_on_mismatch=True，那里会按量重建。
             """
             tol = tick / 2 if tick > 0 else 1e-9
-            return any(abs(price - p) <= tol for p in existing_tp_prices)
+            hit = any(abs(price - p) <= tol for p in existing_tp_prices)
+            if hit and contracts > 0 and not any(
+                _tp_covers(row, price, contracts) for row in existing_tp_rows
+            ):
+                logger.warning(
+                    "%s 触发价 %s 的止盈张数不足本仓所需 %s，但当前是"
+                    "「只补不改」模式（不撤单），本次先跳过；下一轮开仓路径会按量重建",
+                    inst,
+                    format_decimal(price),
+                    format_decimal(contracts),
+                )
+            return hit
 
         # 张数可以是小数（lotSz 常为 0.01），所以 TP1/TP2 各挂半仓是合法的，
         # 不需要再做「只够 1 张就合并」的降级。只有当某一段换算后真的
@@ -1545,6 +1693,11 @@ class OKXTrader:
             # 持仓，因此不需要 sz、也不会因为换算张数为 0 而挂不上。
             use_close_fraction = kind == PROTECT_STOP_LOSS and sl_use_close_fraction
 
+            # 张数换算要放在幂等判断之前：止盈的「在场」判定除了价位还要看量，
+            # 加仓后旧单张数不足时必须重建（2026-11-17 模拟盘实测：持仓 0.2 张、
+            # 止盈只覆盖 0.1 张）。
+            contracts = self._contracts_for(leg_qty, rules)
+
             # 幂等：止损已经有一条全平单、或止盈在这个价位已经挂过，就跳过，
             # 免得重启后重复补挂把止盈叠成双份（实测会多平一倍仓位）。
             if use_close_fraction and existing_sl_all:
@@ -1554,11 +1707,11 @@ class OKXTrader:
                         ok=True,
                         trigger_price=round(trigger, 8),
                         qty=round(leg_qty, 8),
-                        message="已有全平止损条件单在场，本次不重复挂",
+                        message="同价位已有止损条件单在场（全平语义），本次不重复挂",
                     )
                 )
                 continue
-            if kind != PROTECT_STOP_LOSS and _tp_already_exists(trigger):
+            if kind != PROTECT_STOP_LOSS and _tp_already_exists(trigger, contracts):
                 out.append(
                     ProtectionOrder(
                         kind=kind,
@@ -1570,7 +1723,6 @@ class OKXTrader:
                 )
                 continue
 
-            contracts = self._contracts_for(leg_qty, rules)
             if contracts <= 0 and not use_close_fraction:
                 out.append(
                     ProtectionOrder(
@@ -1597,9 +1749,14 @@ class OKXTrader:
                 )
                 continue
 
+            # 本腿自己的 tdMode：被 51023/51169 拒时只改这一条腿，
+            # 不改后面的腿（每条腿各自独立成败）。
+            leg_td_mode = td_mode
+            td_mode_retried = False
+            pos_side_retried = False
             params: dict[str, Any] = {
                 "instId": inst,
-                "tdMode": td_mode,
+                "tdMode": leg_td_mode,
                 "side": close_side,
                 "ordType": "conditional",
                 "reduceOnly": True,
@@ -1646,17 +1803,177 @@ class OKXTrader:
             algo_id = str(first.get("algoId", "") or "")
             sub_code = str(first.get("sCode", "") or "")
             if sub_code not in ("", "0"):
-                sub_msg = str(first.get("sMsg", "") or "").strip()
-                out.append(
-                    ProtectionOrder(
-                        kind=kind,
-                        trigger_price=round(trigger_px, 8),
-                        qty=reported_qty,
-                        message=f"OKX 保护单被拒 {sub_code}: {sub_msg}".strip(),
-                        raw=dict(payload),
+                # tdMode 与持仓真实保证金模式不一致（GUI / 诊断脚本用
+                # settings.json 的模式构造实例，而持仓是另一个模式开的）
+                # 时 OKX 回 51023 / 51169，此时按相反模式重试一次即可自愈。
+                # 2026-11-17 线上：实例 isolated、持仓 cross，新仓三条保护单
+                # 全被 51023 拒，仓位裸奔。只重试一次，避免来回抖动。
+                if sub_code in _MARGIN_MODE_REJECT_CODES and not td_mode_retried:
+                    td_mode_retried = True
+                    leg_td_mode = (
+                        MARGIN_CROSS
+                        if leg_td_mode == MARGIN_ISOLATED
+                        else MARGIN_ISOLATED
                     )
-                )
-                continue
+                    logger.warning(
+                        "%s 保护单 tdMode=%s 被拒（OKX %s: %s），改按 %s 重试一次",
+                        inst,
+                        params.get("tdMode", ""),
+                        sub_code,
+                        str(first.get("sMsg", "") or "").strip(),
+                        leg_td_mode,
+                    )
+                    params["tdMode"] = leg_td_mode
+                    payload, err = self._request(
+                        "POST", _ALGO_ORDER_PATH, body=params, signed=True
+                    )
+                    if payload is None:
+                        out.append(
+                            ProtectionOrder(
+                                kind=kind,
+                                trigger_price=round(trigger_px, 8),
+                                qty=reported_qty,
+                                message=err
+                                or "OKX 保护单提交失败（状态未知，请到交易所核对）",
+                                raw={"request": params},
+                            )
+                        )
+                        continue
+                    data = payload.get("data") or []
+                    first = data[0] if data and isinstance(data[0], dict) else {}
+                    algo_id = str(first.get("algoId", "") or "")
+                    sub_code = str(first.get("sCode", "") or "")
+                # posSide 自愈（2026-11-17 自检 O6）：账户其实是净持仓时多传
+                # posSide 会被 51010 拒；持仓模式查询失败 / 缓存过期时这里会
+                # 按 long_short 发，三条保护单全挂不上、仓位裸奔。
+                if (
+                    sub_code == _POSSIDE_REJECT_CODE
+                    and "posSide" in params
+                    and not pos_side_retried
+                ):
+                    pos_side_retried = True
+                    params.pop("posSide", None)
+                    self._pos_mode = _POS_MODE_NET
+                    logger.warning(
+                        "%s 保护单带 posSide=%s 被 OKX %s 拒（%s），"
+                        "按净持仓去掉 posSide 重试一次",
+                        inst,
+                        pos_side,
+                        sub_code,
+                        str(first.get("sMsg", "") or "").strip(),
+                    )
+                    payload, err = self._request(
+                        "POST", _ALGO_ORDER_PATH, body=params, signed=True
+                    )
+                    if payload is None:
+                        out.append(
+                            ProtectionOrder(
+                                kind=kind,
+                                trigger_price=round(trigger_px, 8),
+                                qty=reported_qty,
+                                message=err
+                                or "OKX 保护单提交失败（状态未知，请到交易所核对）",
+                                raw={"request": params},
+                            )
+                        )
+                        continue
+                    data = payload.get("data") or []
+                    first = data[0] if data and isinstance(data[0], dict) else {}
+                    algo_id = str(first.get("algoId", "") or "")
+                    sub_code = str(first.get("sCode", "") or "")
+                # 交易所明确拒绝 closeFraction 这个参数时，才回退到固定张数。
+                # 网络层失败（payload is None）绝不重试 —— 那可能已经挂上了，
+                # 重试会变成两条止损单（第二条被 51088 拒）。
+                if (
+                    use_close_fraction
+                    and sub_code in _CLOSE_FRACTION_REJECT_CODES
+                    and contracts > 0
+                ):
+                    logger.warning(
+                        "%s 止损腿不接受 closeFraction=1（OKX %s: %s），"
+                        "退回固定张数 %s 重挂",
+                        inst,
+                        sub_code,
+                        str(first.get("sMsg", "") or "").strip(),
+                        format_decimal(contracts),
+                    )
+                    params.pop("closeFraction", None)
+                    params["sz"] = format_decimal(contracts)
+                    reported_qty = round(contracts * per_contract, 8)
+                    payload, err = self._request(
+                        "POST", _ALGO_ORDER_PATH, body=params, signed=True
+                    )
+                    if payload is None:
+                        out.append(
+                            ProtectionOrder(
+                                kind=kind,
+                                trigger_price=round(trigger_px, 8),
+                                qty=reported_qty,
+                                message=err
+                                or "OKX 保护单提交失败（状态未知，请到交易所核对）",
+                                raw={"request": params},
+                            )
+                        )
+                        continue
+                    data = payload.get("data") or []
+                    first = data[0] if data and isinstance(data[0], dict) else {}
+                    algo_id = str(first.get("algoId", "") or "")
+                    sub_code = str(first.get("sCode", "") or "")
+                # 同方向已有止损（51088）且价位不是本仓要的：那是上一个仓位
+                # 遗留的孤儿单（仓位被止盈平掉后，reduceOnly 条件单不会自动
+                # 消失）。它会把本仓的止损永远顶掉 —— 2026-11-17 线上就是
+                # 这样：新多仓要挂 1808.70，场上仍是旧仓的 1809.18，止损腿
+                # 被拒后没人处理，新仓裸奔。这里撤掉旧的那一族止损再重挂一次。
+                # 只撤止损、不碰止盈、不碰仓位；撤完挂不上也只是「本来就没
+                # 保护」，不会比现状更差。
+                if (
+                    sub_code == _STOP_LOSS_CONFLICT_CODE
+                    and kind == PROTECT_STOP_LOSS
+                    and existing_sl_rows
+                ):
+                    logger.warning(
+                        "%s 场上已有旧止损（价位 %s，与本仓计划 %s 不一致），"
+                        "先撤掉再按本仓重建",
+                        inst,
+                        [
+                            format_decimal(to_float(r.get("slTriggerPx"), 0.0))
+                            for r in existing_sl_rows
+                        ],
+                        format_decimal(trigger_px),
+                    )
+                    self._cancel_algo_orders(inst, existing_sl_rows)
+                    existing_sl_rows = []
+                    payload, err = self._request(
+                        "POST", _ALGO_ORDER_PATH, body=params, signed=True
+                    )
+                    if payload is None:
+                        out.append(
+                            ProtectionOrder(
+                                kind=kind,
+                                trigger_price=round(trigger_px, 8),
+                                qty=reported_qty,
+                                message=err
+                                or "OKX 保护单提交失败（状态未知，请到交易所核对）",
+                                raw={"request": params},
+                            )
+                        )
+                        continue
+                    data = payload.get("data") or []
+                    first = data[0] if data and isinstance(data[0], dict) else {}
+                    algo_id = str(first.get("algoId", "") or "")
+                    sub_code = str(first.get("sCode", "") or "")
+                if sub_code not in ("", "0"):
+                    sub_msg = str(first.get("sMsg", "") or "").strip()
+                    out.append(
+                        ProtectionOrder(
+                            kind=kind,
+                            trigger_price=round(trigger_px, 8),
+                            qty=reported_qty,
+                            message=f"OKX 保护单被拒 {sub_code}: {sub_msg}".strip(),
+                            raw=dict(payload),
+                        )
+                    )
+                    continue
 
             out.append(
                 ProtectionOrder(

@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -183,12 +185,28 @@ class PendingWriter:
         tmp: Path | None = None
         try:
             text = json.dumps(data, ensure_ascii=False, indent=2)
-            tmp = path.with_name(path.name + ".tmp")
+            # 唯一临时名（2026-11-17 自检 O1）：原来是固定的
+            # "<记录名>.tmp"。GUI 与守护进程同一秒写同名记录时会共用
+            # 同一个临时文件：一方 replace 后，另一方的 fd 指向已改名的
+            # 文件，finally 里的 unlink 再把对方还没 replace 的内容删掉，
+            # 记录就这样静默丢失。加 pid + 随机后缀，各自独立。
+            tmp = path.with_name(
+                f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+            )
             with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
                 fh.write(text)
                 fh.flush()
                 os.fsync(fh.fileno())
-            os.replace(tmp, path)
+            # Windows 上杀毒 / 索引器可能短暂占用目标文件，os.replace 会
+            # 报 PermissionError。重试三次再放弃，语义仍是原来的 OSError。
+            for _attempt in range(3):
+                try:
+                    os.replace(tmp, path)
+                    break
+                except OSError:
+                    if _attempt >= 2:
+                        raise
+                    time.sleep(0.05 * (_attempt + 1))
         except OSError as exc:
             self._handle_disk_error(exc, path)
         finally:

@@ -70,8 +70,12 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
         if getattr(args, "dry_run_trade", False):
-            cfg.settings.auto_trade.dry_run = True
-            logger.warning("--dry-run-trade 生效：自动交易强制走试运行")
+            # 2026-11-17 审计 P0-2：以前这里只改内存里的
+            # cfg.settings.auto_trade.dry_run。而 _reload_if_settings_changed()
+            # 只要 settings.json 的 mtime 一变，就会用磁盘上的新对象整体替换
+            # settings —— dry_run 变回 false，运维以为在试运行，实际在真实下单。
+            # 改成把「命令行强制试运行」记进 runner，每次重载后重新施加。
+            runner.force_dry_run()
 
         try:
             if getattr(args, "once", False):

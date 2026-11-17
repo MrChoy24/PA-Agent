@@ -51,6 +51,18 @@ logger = logging.getLogger(__name__)
 #: 与 PushPlus 保持一致的请求超时
 _REQUEST_TIMEOUT_S = 15
 
+#: 网络类失败的重试策略（2026-11-17 审计 P1-5）。
+#: webhook 是单点 HTTP 接口：一次 DNS 抖动 / 连接被重置就会丢掉一条「实盘成交」
+#: 回报，而回报丢了没人会知道。所以对网络类失败做一次短退避重试；总耗时必须封顶
+#: （_RETRY_TOTAL_BUDGET_S），否则同一 tick 里几条消息串行重试会把轮询循环拖死。
+_RETRY_ATTEMPTS = 2
+_RETRY_BACKOFF_S = 0.2
+_RETRY_TOTAL_BUDGET_S = 10.0
+
+#: 钉钉「发送太快」类错误码：130101（超过 20 条/分钟）、410100（限流）。
+#: 命中时给出明确提示，而不是只打一行 errcode（2026-11-17 审计 P1-5）。
+_RATE_LIMIT_ERRCODES = frozenset({130101, 410100})
+
 _DEFAULT_MSG_TYPE = "markdown"
 
 #: settings.json 中 dingtalk 段的字段默认值
@@ -132,6 +144,24 @@ def _normalize_config(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _explicitly_configured(section: Any, key: str) -> bool:
+    """配置段里是否**显式写过** ``key``（区分「未配置」与「明确关闭」）.
+
+    2026-11-17 审计 P2-10：``Settings()`` 的默认值不可信 —— ``dingtalk.enabled``
+    的默认就是 False，光看取值分不出「用户没配过」和「用户明确关掉了」。pydantic
+    的 ``model_fields_set`` 正好记录了哪些字段是显式赋值的（从文件载入或代码赋值
+    都会进这个集合），dict 则直接看键是否存在。
+    """
+    if section is None:
+        return False
+    if isinstance(section, dict):
+        return key in section
+    fields_set = getattr(section, "model_fields_set", None)
+    if isinstance(fields_set, (set, frozenset)):
+        return key in fields_set
+    return hasattr(section, key)
+
+
 def _dingtalk_config_dict(settings: "Settings | None" = None) -> dict[str, Any]:
     """读取钉钉配置：settings.dingtalk → settings.json → 环境变量.
 
@@ -159,9 +189,17 @@ def _dingtalk_config_dict(settings: "Settings | None" = None) -> dict[str, Any]:
         env_url = (os.environ.get("DINGTALK_WEBHOOK_URL") or "").strip()
         if env_url:
             cfg["webhook_url"] = env_url
-            # 环境变量只在配置段缺失时生效；既然整体由 env 提供，
-            # 就等于「已配置」，不应因为 settings 里的 enabled=False 而失效。
-            cfg["enabled"] = True
+            # 2026-11-17 部署回归修正：不能用「settings 里写过 enabled」判断
+            # 用户意图 —— settings.json 由 GUI 保存时总是写全字段，enabled=false
+            # 是默认值而不是「明确关闭」。线上因此静默变成 dingtalk=off：
+            # .env 里 webhook 齐全，但合并后 enabled=False，一条通知都发不出去。
+            #
+            # 判据改为「settings 里是否也配了 webhook」：
+            #   * 配了  → 用户在 GUI 里管钉钉，enabled=false 是明确关闭，必须尊重；
+            #   * 没配  → 钉钉只由 .env 提供，运维放 webhook 就是要通知。
+            settings_webhook = str(raw.get("webhook_url") or "").strip()
+            if not settings_webhook:
+                cfg["enabled"] = True
     if not cfg["secret"]:
         env_secret = (os.environ.get("DINGTALK_SECRET") or "").strip()
         if env_secret:
@@ -372,11 +410,54 @@ def _post(
 
     target = _signed_url(url, cfg.get("secret") or "")
 
-    try:
-        resp = httpx.post(target, json=payload, timeout=_REQUEST_TIMEOUT_S)
-    except Exception as exc:
-        logger.warning("%s HTTP 请求失败: %s", action, exc)
-        return False, f"{action} HTTP 请求失败：{exc}"
+    # 2026-11-17 审计 P1-5：旧实现对网络失败零重试，一次 DNS 抖动 / 连接重置
+    # 就把这条回报丢掉（丢了也没人知道）。改成「有限次重试 + 短退避 + 总耗时封顶」：
+    # 每次请求的 timeout 取「剩余预算」，所以整个 _post() 最坏也不会超过
+    # _RETRY_TOTAL_BUDGET_S，同一 tick 里连发几条也不会把轮询循环拖死。
+    deadline = time.monotonic() + _RETRY_TOTAL_BUDGET_S
+    resp: Any = None
+    last_exc: Exception | None = None
+    for attempt in range(1, _RETRY_ATTEMPTS + 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.5:
+            break
+        try:
+            resp = httpx.post(
+                target,
+                json=payload,
+                timeout=min(float(_REQUEST_TIMEOUT_S), remaining),
+            )
+            last_exc = None
+            break
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                "%s HTTP 请求失败（第 %d/%d 次）：%s",
+                action,
+                attempt,
+                _RETRY_ATTEMPTS,
+                exc,
+            )
+            if attempt < _RETRY_ATTEMPTS:
+                pause = min(
+                    _RETRY_BACKOFF_S * attempt,
+                    max(0.0, deadline - time.monotonic() - 0.5),
+                )
+                if pause > 0:
+                    time.sleep(pause)
+    if resp is None:
+        reason = last_exc if last_exc is not None else "重试总耗时超限"
+        logger.warning("%s HTTP 请求失败: %s", action, reason)
+        return False, f"{action} HTTP 请求失败：{reason}"
+
+    # 2026-11-17 审计 P1-5：旧实现只看响应体里的 errcode，从不看 HTTP 状态码。
+    # 网关 5xx / 代理 407 / webhook 地址写错时的 404 都会得到一段 HTML，
+    # 解析失败只报「无法解析响应」，真正的原因（状态码）被吞掉。
+    status_code = getattr(resp, "status_code", None)
+    if isinstance(status_code, int) and not 200 <= status_code < 300:
+        snippet = str(getattr(resp, "text", "") or "")[:200].replace("\n", " ")
+        logger.warning("%s 返回 HTTP %s：%s", action, status_code, snippet or "（无响应正文）")
+        return False, f"{action}失败：HTTP {status_code}（{snippet or '无响应正文'}）"
 
     data = _parse_reply(resp)
     if data is None:
@@ -388,6 +469,25 @@ def _post(
     if errcode == 0 or str(errcode) == "0":
         logger.info("%s发送成功（errmsg=%s）", action, errmsg or "ok")
         return True, f"{action}发送成功（errcode=0, errmsg={errmsg or 'ok'}）"
+
+    # 2026-11-17 审计 P1-5：钉钉机器人限 20 条/分钟，被限流后旧实现只打一行
+    # errcode 就 return False，运维看不出「要等一会儿 / 要分流」。命中限流码时
+    # 给出明确可执行提示。
+    try:
+        errcode_num = int(errcode)
+    except (TypeError, ValueError):
+        errcode_num = -1
+    if errcode_num in _RATE_LIMIT_ERRCODES:
+        logger.warning(
+            "%s被钉钉限流：errcode=%s errmsg=%s（机器人限 20 条/分钟）",
+            action,
+            errcode,
+            errmsg,
+        )
+        return False, (
+            f"{action}失败：被钉钉限流（errcode={errcode}, errmsg={errmsg or 'unknown'}）。"
+            "钉钉自定义机器人限 20 条/分钟，请降低推送频率或改用多个群机器人分流"
+        )
 
     logger.warning("%s返回错误：errcode=%s errmsg=%s", action, errcode, errmsg)
     return False, f"{action}失败（errcode={errcode}, errmsg={errmsg or 'unknown'}）"
@@ -414,16 +514,39 @@ def dingtalk_is_active(settings: "Settings | None" = None) -> bool:
     return bool(cfg["enabled"] and cfg["webhook_url"])
 
 
+def _order_only_skips(cfg: dict[str, Any], order: bool) -> bool:
+    """``notify_on_order_only=True`` 时只放行订单类消息（2026-11-17 审计 P2-9）.
+
+    旧实现里这个键只在 ``_CONFIG_DEFAULTS`` / ``_normalize_config`` 出现过，
+    ``send_text`` / ``send_markdown`` / ``send_order_signal`` / ``send_trade_report``
+    没有任何一处读取它 —— GUI 里勾选「仅推送下单信号」实际不生效。
+    现在在发送入口统一过滤：订单类（下单信号 / 成交回报 / 订单相关告警）放行，
+    普通文本与普通 markdown 直接跳过。
+    """
+    if not cfg.get("notify_on_order_only", True):
+        return False
+    if order:
+        return False
+    logger.debug("钉钉通知：notify_on_order_only=true，跳过非订单类消息")
+    return True
+
+
 def send_text(
     content: str,
     *,
     settings: "Settings | None" = None,
     at_mobiles: Any = None,
     at_all: Any = None,
+    order: bool = False,
 ) -> bool:
-    """发送纯文本消息（msgtype=text）."""
+    """发送纯文本消息（msgtype=text）.
+
+    ``order=True`` 表示这是订单类消息（默认 False = 普通文本）。
+    """
     try:
         cfg = _dingtalk_config_dict(settings)
+        if _order_only_skips(cfg, order):
+            return False
         mobiles, mention_all = _resolve_at(cfg, at_mobiles, at_all)
         payload = {
             "msgtype": "text",
@@ -444,14 +567,20 @@ def send_markdown(
     settings: "Settings | None" = None,
     at_mobiles: Any = None,
     at_all: Any = None,
+    order: bool = False,
 ) -> bool:
     """发送 markdown 消息（msgtype=markdown）.
 
     content 若是已有的 markdown 正文则原样发送；若不以 ``#`` 标题开头，
     会在正文顶部补一行 ``#### {title}``（钉钉正文不自动渲染 title 字段）。
+
+    ``order=True`` 表示这是订单类消息（下单信号 / 成交回报 / 订单相关告警）；
+    默认 False 会被 ``notify_on_order_only`` 过滤掉（2026-11-17 审计 P2-9）。
     """
     try:
         cfg = _dingtalk_config_dict(settings)
+        if _order_only_skips(cfg, order):
+            return False
         mobiles, mention_all = _resolve_at(cfg, at_mobiles, at_all)
         body = str(content or "")
         if title and not body.lstrip().startswith("#"):

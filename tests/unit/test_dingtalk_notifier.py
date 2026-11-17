@@ -113,7 +113,7 @@ def test_is_active_reads_webhook_from_env(monkeypatch: pytest.MonkeyPatch) -> No
 
 # ── (b) 加签：有 secret 追加 timestamp/sign，无 secret 原样 ───────────────────
 def test_sign_appended_when_secret_set(captured: list[dict[str, Any]]) -> None:
-    assert send_text("hello", settings=_settings(secret=_SECRET)) is True
+    assert send_text("hello", settings=_settings(secret=_SECRET, notify_on_order_only=False)) is True
 
     url = captured[0]["url"]
     query = parse_qs(urlparse(url).query)
@@ -134,7 +134,7 @@ def test_sign_appended_when_secret_set(captured: list[dict[str, Any]]) -> None:
 
 
 def test_no_sign_when_secret_absent(captured: list[dict[str, Any]]) -> None:
-    assert send_text("hello", settings=_settings(secret="")) is True
+    assert send_text("hello", settings=_settings(secret="", notify_on_order_only=False)) is True
 
     url = captured[0]["url"]
     query = parse_qs(urlparse(url).query)
@@ -263,15 +263,59 @@ def test_send_order_signal_inactive_skips_http(captured: list[dict[str, Any]]) -
 def test_send_markdown_prefixes_title_and_supports_text_mode(
     captured: list[dict[str, Any]],
 ) -> None:
-    assert send_markdown("测试标题", "第一行", settings=_settings()) is True
+    assert send_markdown("测试标题", "第一行", settings=_settings(notify_on_order_only=False)) is True
     markdown_text = captured[0]["json"]["markdown"]["text"]
     assert markdown_text.startswith("#### 测试标题")
     assert captured[0]["json"]["markdown"]["title"] == "测试标题"
 
-    assert send_markdown("测试标题", "第一行", settings=_settings(msg_type="text")) is True
+    assert send_markdown("测试标题", "第一行", settings=_settings(msg_type="text", notify_on_order_only=False)) is True
     text_payload = captured[1]["json"]
     assert text_payload["msgtype"] == "text"
     assert "测试标题" in text_payload["text"]["content"]
+
+
+# ── (f) notify_on_order_only：普通消息被过滤，订单类放行 ────────────────────
+def test_env_webhook_enables_dingtalk_even_when_settings_persist_enabled_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """线上回归：settings.json 总会写 enabled=false，但它不是「明确关闭」。
+
+    只要 settings 里没配 webhook（钉钉只由 .env 提供），env 给了 webhook
+    就必须把 enabled 打开，否则整条通知链路静默失效（2026-11-17 部署实测
+    启动日志变成 dingtalk=off）。
+    """
+    monkeypatch.setenv("DINGTALK_WEBHOOK_URL", _WEBHOOK)
+    monkeypatch.delenv("DINGTALK_SECRET", raising=False)
+
+    cfg = dt._dingtalk_config_dict(settings=_settings(enabled=False, webhook_url=""))
+
+    assert cfg["enabled"] is True
+    assert cfg["webhook_url"] == _WEBHOOK
+
+
+def test_gui_configured_webhook_honours_enabled_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    """用户在 GUI 里配了 webhook 并关掉开关，env 不得把它重新打开。"""
+    monkeypatch.setenv("DINGTALK_WEBHOOK_URL", "https://example.com/env-hook")
+
+    cfg = dt._dingtalk_config_dict(settings=_settings(enabled=False, webhook_url=_WEBHOOK))
+
+    assert cfg["enabled"] is False
+    assert cfg["webhook_url"] == _WEBHOOK
+
+
+def test_order_only_filter_skips_plain_messages_but_allows_orders(
+    captured: list[dict[str, Any]],
+) -> None:
+    only_orders = _settings(notify_on_order_only=True)
+
+    assert send_text("普通文本", settings=only_orders) is False
+    assert send_markdown("普通标题", "普通正文", settings=only_orders) is False
+    assert captured == []
+
+    assert send_text("订单通知", settings=only_orders, order=True) is True
+    assert send_markdown("订单标题", "订单正文", settings=only_orders, order=True) is True
+    assert len(captured) == 2
+
 
 
 # ── (e) send_test_message 成功 / 失败分支 ────────────────────────────────────

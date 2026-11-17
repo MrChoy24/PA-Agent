@@ -294,6 +294,71 @@ def _failure_report(**overrides):
     return report
 
 
+def _resume_report(**overrides):
+    report = {
+        "symbol": "ETH-USDT-SWAP",
+        "position_side": "long",
+        "entry_price": 1816.66,
+        "qty": 0.055,
+        "ok_count": 3,
+        "order_id": "4105634441777123328",
+        "fill_confirmed": False,
+        "protections": (
+            ProtectionOrder(kind=PROTECT_STOP_LOSS, ok=False, trigger_price=1800.63,
+                            qty=0.055, message="51278"),
+            ProtectionOrder(kind=PROTECT_TAKE_PROFIT_1, ok=True, trigger_price=1824.14,
+                            qty=0.028, order_id="444", message=""),
+        ),
+    }
+    report.update(overrides)
+    return report
+
+
+def test_unconfirmed_resume_sends_a_check_reminder_not_a_fill_report(captured):
+    """2026-11-17 事故：委托没成交却推了「成交回报」。
+
+    fill_confirmed 为 False 时必须走核对提示，绝不能走 send_trade_report。
+    """
+    assert trade_report.notify_trigger_resumed(_resume_report(), venue="okx") is True
+
+    assert captured[0]["action"] != "钉钉成交回报"
+    body = _body(captured)
+    assert "未确认成交" in body
+    assert "ETH-USDT-SWAP" in body
+    assert "4105634441777123328" in body
+    assert "止损：失败" in body
+    assert "TP1：已挂" in body
+
+
+def test_confirmed_resume_still_sends_the_fill_report(captured):
+    ok = trade_report.notify_trigger_resumed(
+        _resume_report(fill_confirmed=True), venue="okx"
+    )
+
+    assert ok is True
+    assert captured[0]["action"] == "钉钉成交回报"
+
+
+def test_resume_report_without_the_flag_keeps_the_old_behaviour(captured):
+    """旧流水没有 fill_confirmed 字段，不能因为缺字段就把成交回报吞掉。"""
+    report = _resume_report()
+    report.pop("fill_confirmed")
+
+    assert trade_report.notify_trigger_resumed(report, venue="okx") is True
+    assert captured[0]["action"] == "钉钉成交回报"
+
+
+def test_unconfirmed_resume_never_raises(monkeypatch):
+    def boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(dingtalk_notifier, "send_markdown", boom)
+    monkeypatch.setattr(
+        dingtalk_notifier, "dingtalk_is_active", lambda settings=None: True
+    )
+    assert trade_report.notify_trigger_resumed(_resume_report()) is False
+
+
 def test_protection_failure_is_pushed_with_exchange_reasons(captured):
     """成交了但一条保护单都没挂上，必须推一条带交易所原因的告警。"""
     assert trade_report.notify_protection_failure(_failure_report(), venue="okx") is True

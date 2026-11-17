@@ -105,10 +105,12 @@ def test_daemon_describe_never_leaks_secrets() -> None:
 def test_timeframe_seconds_falls_back_for_unknown() -> None:
     assert _timeframe_seconds("15m") == 900
     assert _timeframe_seconds("4h") == 14400
-    # "3M" is parsed case-insensitively as 3 minutes, not month.
-    assert _timeframe_seconds("3M") == 180
-    # Truly unparseable → conservative 1h fallback.
-    assert _timeframe_seconds("1mon") == 3600
+    # 大写 M 是月线（3 × 30 天），小写 m 才是分钟 —— 与 timeframe_to_seconds 一致。
+    assert _timeframe_seconds("3M") == 3 * 30 * 86400
+    assert _timeframe_seconds("3m") == 180
+    # 2026-11-17 审计 P2-12：无法识别的周期返回 None（由 validate() 拒绝启动、
+    # bar_seconds 属性退回 1 小时），不再静默当成 3600 继续跑。
+    assert _timeframe_seconds("1mon") is None
 
 
 def test_config_from_args_reads_overrides(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -731,7 +733,9 @@ def test_describe_shows_dingtalk_on_when_env_provides_webhook(monkeypatch: pytes
     同一轮末尾却是「钉钉下单信号发送成功」，自相矛盾，让运维误判通知坏了。
     """
     cfg = _config()
-    cfg.settings.dingtalk.enabled = False
+    # 2026-11-17 审计 P2-10：只有在 settings 里**从没写过** enabled 时，env 提供的
+    # webhook 才会把通道视为启用。这里不能显式赋值 enabled=False（那等于「用户
+    # 明确关闭」，必须尊重），只清空 webhook/secret 让它们走 env 兜底。
     cfg.settings.dingtalk.webhook_url = ""
     cfg.settings.dingtalk.secret = ""
     monkeypatch.setenv("DINGTALK_WEBHOOK_URL", "https://oapi.dingtalk.com/robot/send?access_token=abc")

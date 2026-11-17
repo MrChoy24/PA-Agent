@@ -121,6 +121,24 @@ _RECV_WINDOW_MS = 5000
 # 交易所默认最小名义金额（filter 缺失时的保底值，单位 USDT）
 _DEFAULT_MIN_NOTIONAL = 5.0
 
+# 条件单（止损/止盈）在 ``GET /fapi/v1/openOrders`` 里也会出现，靠 type 区分。
+# 保护单幂等比对要用到它：同价位的腿必须跳过，否则补偿链路每轮重试都会
+# 在交易所侧堆出一串重复止损（2026-11-17 审计 P0-5）。
+_CONDITIONAL_ORDER_TYPES: frozenset[str] = frozenset(
+    {"STOP_MARKET", "TAKE_PROFIT_MARKET", "STOP", "TAKE_PROFIT"}
+)
+
+# 价格比较容差（相对值）。交易所回报的 stopPrice 是字符串，取整误差在
+# tickSize 量级；用相对容差避免「同一条腿」被当成新腿重复挂。
+_PX_TOLERANCE = 1e-6
+
+
+def _px_close(a: float, b: float) -> bool:
+    """两个价位是否算同一档（相对容差 ``_PX_TOLERANCE``）。"""
+    if a <= 0 or b <= 0:
+        return False
+    return abs(a - b) <= max(abs(a), abs(b)) * _PX_TOLERANCE
+
 # 这些状态码属于「主机不可用」，换下一台主机重试
 _HOST_LEVEL_STATUS = (403, 418, 429, 451, 500, 502, 503, 504)
 
@@ -980,7 +998,19 @@ class BinanceTrader:
             )
 
         order_id = str(payload.get("orderId", "") or "")
-        filled_qty = to_float(payload.get("executedQty"), qty)
+        # 「已成交」必须由交易所状态决定，不能靠默认值。
+        # 旧实现从不给 ``TradeResult.filled`` 赋值，它默认是 True ——
+        # 于是限价单刚挂上（status=NEW、executedQty=0）也被上层当成
+        # 成交，立刻去挂保护单：交易所侧还没有持仓，三条腿全被拒，
+        # 而且不会写 pending_fill，成交后也没人补挂（2026-11-17 审计 P1-10）。
+        executed_qty = to_float(payload.get("executedQty"), 0.0)
+        status_u = str(payload.get("status", "") or "").strip().upper()
+        filled = (
+            type_u != "LIMIT"
+            or status_u in ("FILLED", "PARTIALLY_FILLED")
+            or executed_qty > 0
+        )
+        filled_qty = executed_qty or qty
         avg_price = 0.0
         try:
             fills = payload.get("fills") or ()
@@ -1009,6 +1039,7 @@ class BinanceTrader:
             order_type=type_u,
             qty=filled_qty or qty,
             price=avg_price or order_price,
+            filled=filled,
             message=(
                 f"Binance {scope} {type_u} {side_u} {sym} 已提交"
                 f"（数量 {format_decimal(filled_qty or qty)}，"
@@ -1026,6 +1057,50 @@ class BinanceTrader:
             margin_mode=mode if is_futures else MARGIN_ISOLATED,
         )
 
+    def _existing_conditional_orders(
+        self,
+        symbol: str,
+        market: str,
+        close_side: str,
+        hedge: bool,
+        position_side: str,
+    ) -> list[dict[str, Any]]:
+        """当前在挂的止损/止盈条件单（只收本方向平仓腿）。
+
+        Binance 把条件单和普通挂单放在同一个 ``GET /fapi/v1/openOrders`` 里，
+        靠 ``type`` 区分。查询失败一律返回空列表 —— 宁可重复挂一条，也不能
+        因为一次网络抖动让保护单完全挂不上（与 OKX 侧同一约定）。
+        """
+        if not self._has_credentials() or not symbol:
+            return []
+        payload, err = self._request(
+            "GET",
+            self._path("open_orders", market),
+            {"symbol": symbol},
+            signed=True,
+            market=market,
+        )
+        if payload is None:
+            logger.warning(
+                "Binance 查询 %s 在挂条件单失败（%s），本次按「没有在挂单」处理",
+                symbol,
+                err,
+            )
+            return []
+        want_side = "LONG" if position_side == POSITION_LONG else "SHORT"
+        rows: list[dict[str, Any]] = []
+        for item in payload if isinstance(payload, list) else []:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("type") or "").upper() not in _CONDITIONAL_ORDER_TYPES:
+                continue
+            if str(item.get("side") or "").upper() != close_side:
+                continue
+            if hedge and str(item.get("positionSide") or "").upper() != want_side:
+                continue
+            rows.append(item)
+        return rows
+
     def place_protections(
         self,
         symbol: str,
@@ -1033,6 +1108,8 @@ class BinanceTrader:
         position_side: str = POSITION_LONG,
         plans: list[tuple[str, float, float, str]],
         market_type: str | None = None,
+        margin_mode: str | None = None,  # noqa: ARG002 — 见下方说明
+        replace_on_mismatch: bool = True,
     ) -> list[ProtectionOrder]:
         """开仓成功后立刻把止损 / TP1 / TP2 挂成交易所侧条件单。
 
@@ -1105,6 +1182,13 @@ class BinanceTrader:
                     tp_legs_splittable = False
                 tp_total_qty += to_float(_qty, 0.0)
         merge_tp = (not tp_legs_splittable) and tp_total_qty > 0
+
+        # 幂等前置：先取场上已在挂的条件单。旧实现没有这一步，补偿链路
+        # ``resume_pending_trigger()`` 每轮重试都会把已挂好的腿再挂一遍，
+        # 交易所侧堆出一串重复止损（2026-11-17 审计 P0-5）。
+        existing = self._existing_conditional_orders(
+            sym, mkt, close_side, hedge, pos_side
+        )
 
         out: list[ProtectionOrder] = []
         for kind, price, qty, problem in plans:
@@ -1206,6 +1290,55 @@ class BinanceTrader:
                     params["reduceOnly"] = "true"
                 sent_qty = qty_leg
 
+            # 同类型 + 同价位已在场就跳过。止损是 closePosition 全平语义，
+            # 只看价位；止盈还要看张数够不够（加仓后旧止盈张数不足，必须补）。
+            hit = None
+            for row in existing:
+                if str(row.get("type") or "").upper() != str(params.get("type") or ""):
+                    continue
+                if not _px_close(to_float(row.get("stopPrice"), 0.0), trigger_px):
+                    continue
+                if not is_stop:
+                    have = to_float(row.get("origQty"), 0.0)
+                    if have > 0 and have + 1e-9 < sent_qty:
+                        continue
+                hit = row
+                break
+            if hit is not None:
+                out.append(
+                    ProtectionOrder(
+                        kind=kind,
+                        ok=True,
+                        trigger_price=round(trigger_px, 8),
+                        qty=round(sent_qty, 8),
+                        order_id=str(hit.get("orderId", "") or ""),
+                        message="该价位已有同向保护单在场，本次不重复挂",
+                    )
+                )
+                logger.info(
+                    "Binance 保护单已在场，跳过 %s %s 触发价 %s orderId=%s",
+                    sym,
+                    params.get("type"),
+                    format_decimal(trigger_px),
+                    hit.get("orderId", ""),
+                )
+                continue
+
+            # 换价位重建止损时，旧价位的止损要撤掉，否则触发时会先按旧价
+            # 全平（止盈还没到就出场）。只撤**新单挂成功之后**才动手 ——
+            # 撤了旧的而新的挂失败，等于让仓位裸奔。
+            stale_stops: list[dict[str, Any]] = []
+            if is_stop and replace_on_mismatch:
+                stale_stops = [
+                    row
+                    for row in existing
+                    if str(row.get("type") or "").upper()
+                    == str(params.get("type") or "")
+                    and not _px_close(
+                        to_float(row.get("stopPrice"), 0.0), trigger_px
+                    )
+                ]
+
             payload, err = self._request(
                 "POST",
                 self._path("conditional_order", mkt),
@@ -1252,6 +1385,19 @@ class BinanceTrader:
                     raw=dict(payload),
                 )
             )
+            for row in stale_stops:
+                old_id = str(row.get("orderId", "") or "")
+                if not old_id:
+                    continue
+                logger.warning(
+                    "Binance 撤销 %s 旧止损 %s（价位 %s，与本仓计划 %s 不一致）",
+                    sym,
+                    old_id,
+                    row.get("stopPrice", ""),
+                    format_decimal(trigger_px),
+                )
+                self.cancel_order(sym, old_id)
+
             logger.info(
                 "Binance 保护单已挂 %s %s %s 触发价 %s status=%s orderId=%s",
                 sym,
@@ -1301,6 +1447,28 @@ class BinanceTrader:
                 position_side=pos_side,
             )
 
+        # 查不到持仓时 ``_position_size`` 返回 0.0 —— 旧实现会拿 0 去发
+        # 市价单，交易所回 -1013「数量必须大于 0」，而调用方只看到一条
+        # 含糊的拒单。这里提前拦下，并明确告诉调用方是「没有可平的仓」
+        # （2026-11-17 审计 P1-11）。
+        size = self._position_size(sym, pos_side)
+        if size <= 0:
+            logger.warning(
+                "Binance 平仓 %s %s：查询到的持仓数量为 0，已跳过",
+                sym,
+                pos_side,
+            )
+            return TradeResult(
+                ok=False,
+                venue=self.venue,
+                symbol=sym,
+                side=side_u,
+                order_type=ORDER_TYPE_MARKET,
+                qty=0.0,
+                message="当前没有可平的持仓（数量为 0 或查询失败）",
+                market_type=MARKET_FUTURES,
+                position_side=pos_side,
+            )
         return self.place_order(
             sym,
             side_u,
@@ -1308,7 +1476,7 @@ class BinanceTrader:
             market_type=MARKET_FUTURES,
             position_side=pos_side,
             reduce_only=True,
-            quantity=self._position_size(sym, pos_side),
+            quantity=size,
         )
 
     def _position_size(self, symbol: str, position_side: str) -> float:

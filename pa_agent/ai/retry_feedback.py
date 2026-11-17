@@ -96,10 +96,20 @@ def build_retry_feedback(
     for item in forbidden:
         lines.append(f"- {item}")
 
-    geo = _geometry_excerpt(frame) if stage == "stage1" and frame is not None else ""
+    geo = (
+        _geometry_excerpt(frame)
+        if stage == "stage1" and frame is not None and attempt <= 1
+        else ""
+    )
     if geo:
         lines.append("")
         lines.append(geo)
+    elif stage == "stage1" and frame is not None:
+        # 2026-11-17 审计 P1-3：重试轮次不再重复整张几何表（原提示词里已有）。
+        lines.append("")
+        lines.append(
+            "- K 线几何表上文已给出，一律按上文为准；不要重新推算或改写 bar_type。"
+        )
 
     if stage == "stage1" and (
         any("gate_trace" in inv and "answer" in inv for inv in invalid)

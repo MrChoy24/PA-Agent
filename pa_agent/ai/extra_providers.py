@@ -215,6 +215,16 @@ def env_fallbacks(*, default_key: str = "") -> list[Any]:
     entries, problems = parse_fallback_spec(raw, default_key=default_key)
     for problem in problems:
         log.warning("%s 配置有误，已跳过：%s", FALLBACK_SPEC_ENV, problem)
+    if not entries and problems:
+        # 2026-11-17 审计 P2-9：全部条目都解析失败时旧实现只有逐条 WARNING，
+        # 现场看不出「这条链路此刻一个备用都没有」，会静默回落到 settings.json
+        # 的旧列表，与「env 写了就以它为准」的语义相反。这里补一条 ERROR。
+        log.error(
+            "%s 的 %d 条备用接口全部无法解析，本次没有任何自定义备用通道；"
+            "字段顺序应为 name|model|base_url|api_key（api_key 写 - 表示复用主通道 Key）",
+            source,
+            len(problems),
+        )
     # 这是「配置长什么样」的一次性说明，不是每次请求的进度。
     # combined_fallback_chain 每轮分析都会重新解析，不去重就会每轮刷一条。
     if entries and raw not in _ANNOUNCED_SPECS:

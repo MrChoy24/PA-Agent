@@ -18,11 +18,14 @@ Nothing here imports PyQt6, so the whole thing runs on a server with no display.
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 import signal
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from pa_agent.config.paths import (
@@ -42,6 +45,17 @@ logger = logging.getLogger(__name__)
 #: 待触发补偿的检查间隔。它不是实时任务，20 秒一次的 tick 不必每轮都查 ——
 #: 每轮都读日志文件 + 打交易所接口，既浪费一次 TLS 握手，也把实盘告警刷满日志。
 _RESUME_CHECK_INTERVAL_S = 120.0
+
+#: 守护进程的本地状态文件（2026-11-17 审计 P1-8）。
+#: 只存「已经分析过的最后一根已收盘 K 线时间」这类重启后必须延续的状态：
+#: 忘了它的后果是重启后把同一根 K 线再分析一次，而 evaluate() 里没有
+#: 「已有持仓就不再开仓」的检查，可能在同一根 K 线上开出第二笔同向仓位。
+DAEMON_STATE_PATH = PROJECT_ROOT / "records" / "state" / "daemon_state.json"
+
+#: records/pending 自动清理的检查间隔（2026-11-17 用户指示）。
+#: 目录每天约新增 37MB，按保留期（默认 14 天、至少保留最新 200 个）
+#: 定期删旧文件；每小时最多检查一次，实际删除很便宜。
+RECORDS_PRUNE_INTERVAL_S = 3600.0
 
 _ERROR_BACKOFF_S = 15.0
 #: Cap for the exponential backoff after repeated failures.
@@ -75,7 +89,10 @@ class DaemonRunner:
         #: 当前这一轮分析的取消令牌。停止信号要能中断正在跑的 AI 请求，
         #: 否则 docker stop 的宽限期一到就只能 SIGKILL（会留下部分记录）。
         self._cancel_token: Any = None
-        self._last_analyzed_bar_ts: float | None = None
+        #: 已经分析过的最后一根「已收盘」K 线（ts_open，毫秒）。
+        #: 2026-11-17 审计 P1-8：初值从本地状态文件读回 —— Gate 1 只在内存里
+        #: 比较，重启后内存清空，同一根 K 线会被重新分析一次。
+        self._last_analyzed_bar_ts: float | None = self._load_state_bar_ts()
         self._last_analysis_monotonic: float = 0.0
         self._consecutive_errors = 0
         self._rounds = 0
@@ -88,6 +105,19 @@ class DaemonRunner:
         self._resume_checked_at: float = 0.0
         #: 上次看到的 settings.json 修改时间（热重载用）。
         self._settings_mtime: float = self._current_mtime()
+        #: 命令行 --dry-run-trade 的强制项（2026-11-17 审计 P0-2）。
+        #: 热重载会用磁盘上的新对象**整体替换** settings，只在内存里改一次
+        #: dry_run 是留不住的 —— 只要有人保存了一次 settings.json，dry_run
+        #: 就变回 false，运维以为在试运行、实际已经在真实下单。所以强制项
+        #: 单独记住，每次重载后重新施加。
+        self._force_dry_run: bool = False
+        #: 上一次已推送的「保护单未挂上」失败指纹（2026-11-17 审计 P1-4）。
+        #: auto_trader.last_resume_failure 只在补挂成功路径清空，其余早退分支
+        #: （持仓已平 / 计划为空 / 查单失败）都不清 —— 直接按它推送会每 120 秒
+        #: 重复推同一条旧告警。这里在 runner 侧按指纹去重。
+        self._resume_failure_fingerprint: str | None = None
+        #: 上次清理 records/pending 的单调时钟（2026-11-17 保留期）。
+        self._last_records_prune_ts: float = 0.0
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
@@ -221,6 +251,80 @@ class DaemonRunner:
         except (OSError, AttributeError, ValueError):
             return 0.0
 
+    # ── 本地状态（重启后必须延续的少量状态） ────────────────────────────────
+
+    def _state_file(self) -> Path:
+        """本地状态文件路径（模块级常量；测试 monkeypatch 它即可换目录）。"""
+        return Path(DAEMON_STATE_PATH)
+
+    def _load_state_bar_ts(self) -> float | None:
+        """从状态文件读回「最后一根已分析 K 线」的时间戳。
+
+        2026-11-17 审计 P1-8：这个值原本只存在内存里，守护进程一重启就丢，
+        于是重启后的第一轮会把**同一根已收盘 K 线**再分析一次。分析链本身
+        没有「已有持仓就不再开仓」的检查，于是可能在同一根 K 线上开出第二笔
+        同向仓位，敞口直接翻倍。
+        """
+        try:
+            raw = json.loads(self._state_file().read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return None
+        if not isinstance(raw, dict):
+            return None
+        try:
+            ts = float(raw.get("last_analyzed_bar_ts"))
+        except (TypeError, ValueError):
+            return None
+        return ts if ts > 0 else None
+
+    def _save_state(self) -> None:
+        """把当前状态原子写盘（tmp + os.replace，写坏不会留下半行）。
+
+        写盘失败只记日志：状态文件丢了的后果是「重启后可能重复分析一根 K 线」，
+        比让它把 tick 打断更轻。
+        """
+        path = self._state_file()
+        payload = {
+            "last_analyzed_bar_ts": self._last_analyzed_bar_ts,
+            "updated_at": int(time.time()),
+        }
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError as exc:
+            logger.warning("守护进程状态文件写入失败（忽略）：%s", exc)
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+    def force_dry_run(self) -> None:
+        """把自动交易强制锁在试运行（--dry-run-trade 用）。
+
+        2026-11-17 审计 P0-2：命令行开关必须**记住**，并在每次配置热重载之后
+        重新施加。旧实现只在启动时改一次内存里的 settings.auto_trade.dry_run，
+        而 _reload_if_settings_changed() 会用磁盘上的新对象整体替换 settings ——
+        只要有人保存了一次 settings.json，dry_run 就变回 false。
+        """
+        self._force_dry_run = True
+        self._apply_forced_dry_run(self._cfg.settings)
+        logger.warning("--dry-run-trade 生效：自动交易强制走试运行（热重载后依然生效）")
+
+    def _apply_forced_dry_run(self, settings: Any) -> None:
+        """把强制试运行施加到一份 settings 上（幂等；重载后必须再调一次）。"""
+        if not self._force_dry_run:
+            return
+        auto = getattr(settings, "auto_trade", None)
+        if auto is None:
+            return
+        if not bool(getattr(auto, "dry_run", True)):
+            logger.warning(
+                "配置里 dry_run=False，但 --dry-run-trade 强制项仍在生效：本次仍按试运行跑"
+            )
+        auto.dry_run = True
+
     def _reload_if_settings_changed(self) -> bool:
         """配置文件被外部改过就重新加载 + 重建分析引擎。
 
@@ -259,6 +363,9 @@ class DaemonRunner:
         from pa_agent.daemon.config import apply_all_env_overrides
 
         apply_all_env_overrides(new_settings)
+        # 2026-11-17 审计 P0-2：强制项必须在**每次**重载之后重新施加，
+        # 否则磁盘上的 dry_run=False 会把命令行开关覆盖掉。
+        self._apply_forced_dry_run(new_settings)
 
         logger.info(
             "配置已热重载（%s）：模型 %s → %s，杠杆 %s → %s，单笔上限 %s → %s USDT",
@@ -304,10 +411,12 @@ class DaemonRunner:
                     getattr(auto, "max_daily_orders", 0),
                 )
 
+        self._prune_pending_records()
         while not self._stop.is_set():
             started = time.monotonic()
             try:
                 outcome = self.tick(force=cfg.analyze_on_start and self._analyses == 0)
+                self._prune_pending_records()
                 if outcome.ran:
                     self._consecutive_errors = 0
                 slept = self._sleep_until_next_poll(started)
@@ -325,6 +434,28 @@ class DaemonRunner:
                 break
 
         logger.info("守护进程已停止（共轮询 %d 次，分析 %d 次）", self._rounds, self._analyses)
+
+    def _prune_pending_records(self) -> None:
+        """按保留期清理 records/pending（间隔见 ``RECORDS_PRUNE_INTERVAL_S``）。
+
+        2026-11-17 用户指示：pending 每天新增约 37MB，无限增长会撑满容器
+        磁盘。策略见 :mod:`pa_agent.records.retention` —— 只删超期的
+        ``*.json`` / ``*.followups.jsonl``，且永远保留最新若干个。
+        清理失败只告警，绝不影响分析 / 交易主链路。
+        """
+        now = time.monotonic()
+        if (
+            self._last_records_prune_ts
+            and now - self._last_records_prune_ts < RECORDS_PRUNE_INTERVAL_S
+        ):
+            return
+        self._last_records_prune_ts = now
+        try:
+            from pa_agent.records.retention import prune_pending
+
+            prune_pending(PROJECT_ROOT / "records" / "pending")
+        except Exception as exc:  # noqa: BLE001 — 维护动作不能拖垮守护进程
+            logger.warning("records/pending 清理失败（不影响交易）：%s", exc)
 
     def _sleep_until_next_poll(self, started_monotonic: float) -> bool:
         """Sleep for the remainder of the poll interval. Returns True if interrupted."""
@@ -518,6 +649,9 @@ class DaemonRunner:
         self._analyses += 1
         self._last_analysis_monotonic = time.monotonic()
         self._last_analyzed_bar_ts = bar_ts_open
+        # 2026-11-17 审计 P1-8：立刻落盘。重启后 Gate 1 靠它判断「这根已经分析过」，
+        # 内存里那份随进程消失。
+        self._save_state()
 
         exc = getattr(record, "exception", None)
         if exc:
@@ -712,7 +846,7 @@ class DaemonRunner:
             opts["testnet"] = bool(getattr(creds, "testnet", False))
         return opts
 
-    def _auto_trader(self):
+    def _auto_trader(self, *, require_enabled: bool = True):
         """复用一个 AutoTrader（内部再复用交易所连接），配置变了才重建。
 
         每轮 tick 都新建实例的话，光 ``__init__`` 里的实盘告警就能把日志刷满；
@@ -722,7 +856,12 @@ class DaemonRunner:
         from pa_agent.trading.auto_trader import AutoTrader
 
         opts = self._auto_trade_options()
-        if not opts.get("enabled"):
+        # 2026-11-17 审计 P1-3：require_enabled=False 供**补偿链路**使用。
+        # 用户关掉自动交易只表示「不要再新开仓」；之前已经挂到交易所的限价单 /
+        # 计划委托照样会成交，那时仓位已经在场上了，补偿链路必须继续给它补挂
+        # 保护单（它不新开仓，所以不该被 enabled 门控）。缓存键与正常路径完全
+        # 一致（同一个 opts），不会重复建连。
+        if not opts.get("enabled") and require_enabled:
             self._auto_trader_cached = None
             self._auto_trader_key = None
             return None
@@ -742,30 +881,79 @@ class DaemonRunner:
         每 ``_RESUME_CHECK_INTERVAL_S`` 秒才真正查一次：待触发补偿不是实时任务，
         20 秒一次的 tick 不需要每轮都读日志文件 + 打交易所接口。
         """
-        if not self._auto_trade_options().get("enabled"):
-            return
+        # 2026-11-17 审计 P1-3：这里**不再**用 auto_trade.enabled 做门控。
+        # 用户关掉自动交易只表示「不要再新开仓」，而之前已经挂到交易所的
+        # 限价单 / 计划委托照样会成交 —— 那时仓位已经在场上了。旧实现在这里
+        # 直接 return，补偿链路一并停摆：仓位裸奔、还没有任何告警。
         now = time.monotonic()
         if now - self._resume_checked_at < _RESUME_CHECK_INTERVAL_S:
             return
         self._resume_checked_at = now
         try:
-            trader = self._auto_trader()
+            # require_enabled=False：补偿链路只给**已存在**的仓位补挂保护单，
+            # 不新开仓，所以不受 enabled 门控（2026-11-17 审计 P1-3）。
+            trader = self._auto_trader(require_enabled=False)
             if trader is None:
                 return
             # 先廉价判断有没有待办，避免白打一次交易所接口
             if trader._last_pending_trigger() is None:
+                # 没有待办 = 上一笔已经处理完，清掉失败指纹，
+                # 让下一笔真正出问题时还能正常告警（2026-11-17 审计 P1-4）。
+                self._resume_failure_fingerprint = None
                 return
             handled, message = trader.resume_pending_trigger()
             # 失败告警优先：保护单一条都没挂上时，那句「已补挂」的成功日志
             # 根本不该打出来（2026-11-16 事故里正是它掩盖了裸奔仓位）。
             failure = getattr(trader, "last_resume_failure", None)
             if failure:
-                self._notify_protection_failure(trader)
+                self._notify_protection_failure_once(trader)
+            elif handled:
+                # 真正补挂成功：清掉指纹，下次再失败要能重新告警。
+                self._resume_failure_fingerprint = None
             if handled:
                 logger.info("自动交易：突破单触发后已补挂保护单（%s）", message)
                 self._notify_trigger_resumed(trader)
         except Exception as exc:  # noqa: BLE001 - 补偿失败不影响主循环
-            logger.debug("突破单补挂检查失败（忽略）：%s", exc)
+            # 2026-11-17 审计 P1-7：这一行以前是 logger.debug，而生产日志级别
+            # 是 INFO —— 读流水 / 查单 / 构造失败全被吞掉，仓位裸奔既没有痕迹
+            # 也没有告警。补偿链路本身是安全兜底，它出问题必须能被看见。
+            logger.warning(
+                "突破单补挂检查失败（%s）：%s", type(exc).__name__, exc, exc_info=True
+            )
+
+    def _has_same_side_position(self, trader, decision: dict) -> bool:
+        """本 symbol 是否已有**同向**持仓（2026-11-17 审计 P1-8 的第二道闸）。
+
+        为什么要有这一道：分析链里没有「已有持仓就不再开仓」的检查，
+        防重复开仓全靠 tick 里的 K 线去重。去重状态一旦丢过（进程重启、
+        状态文件没写成功），同一根已收盘 K 线会被再分析一次，同一方向上
+        再开一笔，敞口翻倍且两笔各挂一套保护单。
+
+        这里用的是 AutoTrader 的私有方法（_client / _symbol_for_venue /
+        _held_position_detail）：AutoTrader 目前没有公开的持仓查询入口，
+        而 trading 层的文件不在本次修复范围内（另一层负责）。私有方法签名
+        若变动，这里会走 except 分支退回旧行为，不会抛进主循环。
+        查询失败时**放行**（只告警）：拒绝开仓等于在网络上抖一下的时候
+        静默停掉交易，改动比风险本身更大。
+        """
+        try:
+            from pa_agent.trading.auto_trader import _decide_side
+
+            side = _decide_side(decision)
+            if side not in ("BUY", "SELL"):
+                return False
+            client = trader._client()
+            if client is None:
+                return False
+            venue_symbol = trader._symbol_for_venue(self._cfg.symbol)
+            position_side = "long" if side == "BUY" else "short"
+            qty, _avg, _mode = trader._held_position_detail(
+                client, venue_symbol, position_side
+            )
+            return qty > 0
+        except Exception as exc:  # noqa: BLE001 - 查不到就退回旧行为
+            logger.warning("自动交易：查询已有持仓失败（本次不拦截开仓）：%s", exc)
+            return False
 
     def _maybe_auto_trade(self, inner: dict) -> str:
         opts = self._auto_trade_options()
@@ -775,6 +963,13 @@ class DaemonRunner:
             trader = self._auto_trader()
             if trader is None:
                 return ""
+            # 2026-11-17 审计 P1-8：开仓前再挡一道「本 symbol 已有同向持仓」。
+            # 分析链本身没有这条检查，靠 K 线去重挡重复开仓 —— 而 K 线去重
+            # 只要状态丢过一次（重启 / 状态文件没写进去）就会失效，后果是
+            # 同一根 K 线上开出第二笔同向仓位、敞口直接翻倍。
+            if self._has_same_side_position(trader, inner):
+                logger.info("自动交易：%s 已有同向持仓，跳过本次开仓", self._cfg.symbol)
+                return "skip: 已有同向持仓"
             last_price = None
             close = inner.get("entry_price")
             try:
@@ -857,6 +1052,42 @@ class DaemonRunner:
             )
         except Exception as exc:  # noqa: BLE001 - 通知失败不影响主循环
             logger.warning("保护单失败告警推送异常（忽略）：%s", exc)
+
+    def _protection_failure_fingerprint(self, report: dict) -> str:
+        """把一份 last_resume_failure 压成可比较的指纹（2026-11-17 审计 P1-4）。
+
+        attempts 要算进去：真正在重试的失败每轮 attempts 会 +1，那种必须每轮
+        都告警；而仓位已经平掉 / 计划为空这类早退分支根本不会重跑补挂，
+        attempts 与 reasons 都不变 —— 指纹相同就说明是同一份旧告警。
+        """
+        reasons = [str(r) for r in (report.get("reasons") or []) if str(r).strip()]
+        return "|".join(
+            [
+                str(report.get("order_id") or ""),
+                str(report.get("position_side") or ""),
+                str(report.get("attempts") or ""),
+                "final" if report.get("final") else "retry",
+                ";".join(reasons),
+            ]
+        )
+
+    def _notify_protection_failure_once(self, trader) -> None:
+        """同一份失败只推一次（2026-11-17 审计 P1-4）。
+
+        AutoTrader.last_resume_failure 只在补挂成功路径清空，其余早退分支
+        （持仓已平 / 计划为空 / 查单失败）都留着上一次的旧值 —— 直接推送
+        会每 120 秒重复推同一条「仓位裸奔」告警，而仓位其实早就平掉或补齐了。
+        这里按指纹去重：相同就不再推，成功或无事可做时由调用方清空指纹。
+        """
+        report = getattr(trader, "last_resume_failure", None)
+        if not isinstance(report, dict) or not report:
+            return
+        fingerprint = self._protection_failure_fingerprint(report)
+        if fingerprint == self._resume_failure_fingerprint:
+            logger.debug("保护单失败告警与上次相同，跳过重复推送：%s", fingerprint)
+            return
+        self._resume_failure_fingerprint = fingerprint
+        self._notify_protection_failure(trader)
 
     # ── health ───────────────────────────────────────────────────────────────
 

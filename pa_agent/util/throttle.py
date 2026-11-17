@@ -51,7 +51,14 @@ class _Bucket:
         self._lock = threading.Lock()
 
     def take(self, tokens: float = 1.0) -> float:
-        """取走 *tokens* 个令牌，返回实际等待的秒数。"""
+        """取走 *tokens* 个令牌，返回实际等待的秒数。
+
+        2026-11-17 自检（O2）：旧实现把 ``time.sleep(wait)`` 放在
+        ``with self._lock:`` 里面，同一个交易所的所有请求被**串行化** ——
+        一个线程补觉时，其余线程连「还剩多少令牌」都算不了。OKX 主域名
+        一次握手超时 20 秒，整条交易链路就跟着排队。现在只在锁内扣令牌、
+        算等待，睡眠放到锁外。
+        """
         with self._lock:
             now = time.monotonic()
             self.tokens = min(self.rate, self.tokens + (now - self.updated) * self.rate)
@@ -69,14 +76,15 @@ class _Bucket:
                     wait,
                     self.rate,
                 )
-                wait = 0.0
                 self.tokens = 0.0
                 return 0.0
 
-            time.sleep(wait)
-            self.updated = time.monotonic()
+            # 预扣本次额度，并把「更新时间」推到等待结束之后：睡眠期间别的
+            # 线程按这个时间点继续计算可用令牌，不会把同一份额度发两次。
             self.tokens = 0.0
-            return wait
+            self.updated = now + wait
+        time.sleep(wait)
+        return wait
 
 
 _BUCKETS: dict[str, _Bucket] = {}

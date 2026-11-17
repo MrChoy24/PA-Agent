@@ -481,7 +481,13 @@ class DaemonConfig:
 
     @property
     def bar_seconds(self) -> int:
-        return _timeframe_seconds(self.timeframe)
+        seconds = _timeframe_seconds(self.timeframe)
+        if seconds is None:
+            # 2026-11-17 审计 P2-12：非法周期由 validate() 在启动时拒绝，正常
+            # 启动走不到这里。真走到了也不能让主循环直接崩（属性必须返回 int），
+            # 退回 1 小时并留痕 —— WARNING 已由 _timeframe_seconds 打出。
+            return 3600
+        return seconds
 
     # ── factories ────────────────────────────────────────────────────────────
 
@@ -561,7 +567,17 @@ class DaemonConfig:
             sources=sources,
         )
 
-        # 剩下这些只有 env / 默认值两层，来源同样记下来。
+        # 剩下这些是 env / settings / 默认值三层，来源同样记下来。
+        # 2026-11-17 审计 P2-11：bar_count 与 incremental_threshold 的真实值来自
+        # settings.json 的 general.analysis_bar_count / general.incremental_max_new_bars，
+        # 以前这里一律按 env/default 标注，启动日志会打出「bar_count=default」
+        # 而实际用的是 settings 里的值，排查配置来源时直接被误导。
+        # model_fields_set 能区分「文件里写过」与「pydantic 默认值」。
+        _general_explicit = set(getattr(general, "model_fields_set", set()) or set())
+        _from_settings = {
+            "bar_count": "analysis_bar_count" in _general_explicit,
+            "incremental_threshold": "incremental_max_new_bars" in _general_explicit,
+        }
         for field_name, env_name in (
             ("bar_count", "PA_DAEMON_BAR_COUNT"),
             ("poll_interval_s", "PA_DAEMON_POLL_INTERVAL"),
@@ -574,7 +590,12 @@ class DaemonConfig:
             ("log_level", "PA_DAEMON_LOG_LEVEL"),
         ):
             has_env = bool(str(os.environ.get(env_name, "") or "").strip())
-            sources.setdefault(field_name, "env" if has_env else "default")
+            if has_env:
+                sources.setdefault(field_name, "env")
+            elif _from_settings.get(field_name):
+                sources.setdefault(field_name, "settings")
+            else:
+                sources.setdefault(field_name, "default")
 
         if overrides:
             for key, value in overrides.items():
@@ -611,6 +632,16 @@ class DaemonConfig:
             raise ConfigError("品种不能为空（PA_DAEMON_SYMBOL）")
         if not str(self.timeframe).strip():
             raise ConfigError("周期不能为空（PA_DAEMON_TIMEFRAME）")
+        # 2026-11-17 审计 P2-12：以前只判非空，周期写错（"1hour" / "30" / "1mon"）
+        # 也能启动，随后 timeframe_to_seconds() 静默回落 3600，runner 用它算
+        # 收盘时刻，Gate2「K 线是否收盘」的判断随之整体失真。这里明确报错。
+        from pa_agent.data.bar_close_wait import timeframe_to_seconds
+
+        if timeframe_to_seconds(self.timeframe) is None:
+            raise ConfigError(
+                f"无法识别的周期 {self.timeframe!r}（PA_DAEMON_TIMEFRAME）："
+                "支持 1m/5m/15m/30m/1h/2h/4h/1d/1w/1M 这类写法（大写 M 表示月线）。"
+            )
 
         if self.bar_count < 10:
             raise ConfigError(
@@ -686,14 +717,20 @@ class DaemonConfig:
         return "配置来源：" + " ".join(parts)
 
 
-def _timeframe_seconds(timeframe: str) -> int:
+def _timeframe_seconds(timeframe: str) -> int | None:
+    """周期 → 秒；无法识别时返回 None（2026-11-17 审计 P2-12）。
+
+    旧实现在这里静默 return 3600：周期写错时 Gate2 的收盘时刻判断全部失真，
+    而且日志里一点痕迹都没有。现在返回 None 由调用方决定（``bar_seconds``
+    属性退回 3600 以免主循环崩，``validate()`` 直接拒绝启动），并且至少留一条
+    WARNING 让它在日志里可见。
+    """
     from pa_agent.data.bar_close_wait import timeframe_to_seconds
 
     seconds = timeframe_to_seconds(timeframe)
     if not seconds:
-        # Unknown timeframe: fall back to a conservative one hour so the loop
-        # still works instead of refusing to start.
-        return 3600
+        logger.warning("无法识别的周期 %r，无法计算 K 线时长", timeframe)
+        return None
     return int(seconds)
 
 

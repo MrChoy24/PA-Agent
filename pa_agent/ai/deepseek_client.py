@@ -1010,6 +1010,7 @@ class DeepSeekClient:
                 **_rl_kwargs,
             )
 
+            finish_reason: str | None = None
             for chunk in stream:
                 # Check cancellation on each chunk
                 if cancel_token is not None and cancel_token.is_set():
@@ -1030,6 +1031,13 @@ class DeepSeekClient:
                 model_name = model_name or (getattr(chunk, "model", "") or "")
 
                 choice0 = chunk.choices[0]
+                # 2026-11-17 审计 P1-2：流式从不读 finish_reason，于是
+                # 「thinking 把 max_tokens 吃满、content 为空」被当成普通空
+                # 输出交给校验器，白白重试 3 轮；上层也没法按「截断不可重试」
+                # 切到备用通道（sensenova_fallback 已经有这套语义）。
+                _finish = getattr(choice0, "finish_reason", None)
+                if _finish:
+                    finish_reason = str(_finish)
                 delta = getattr(choice0, "delta", None)
                 if delta is None:
                     continue
@@ -1069,6 +1077,23 @@ class DeepSeekClient:
             raise
 
         latency_ms = (time.monotonic() - t0) * 1000
+        if finish_reason == "length":
+            # 输出被 max_tokens 截断（最常见是 thinking 吃满预算、正文为空）。
+            # 抛 RuntimeError 让编排层按「截断不可重试」切备用通道，而不是把
+            # 半截 JSON / 空正文送去校验再重试三次。
+            _trace_mark(_trace_model, ok=False)
+            self._log.warning(
+                "DeepSeekClient stream truncated by max_tokens "
+                "(finish_reason=length, content_chars=%d reasoning_chars=%d "
+                "model=%s base_url=%s)",
+                len(content),
+                len(reasoning_content),
+                model_name or self._settings.model,
+                self._settings.base_url,
+            )
+            raise RuntimeError(
+                f"{self._settings.model}: truncated (finish_reason=length)"
+            )
         _trace_mark(_trace_model, ok=True)
 
         usage = AIUsage(
@@ -1092,6 +1117,7 @@ class DeepSeekClient:
                 "total_tokens": usage.total_tokens,
             },
             "latency_ms": latency_ms,
+            "finish_reason": finish_reason,
         }
 
         self._log.info(

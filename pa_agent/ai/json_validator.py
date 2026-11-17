@@ -230,14 +230,27 @@ def _escape_control_chars_in_json_strings(text: str) -> str:
 
 
 def coalesce_model_json_text(content: str, reasoning: str | None = None) -> str:
-    """Prefer content JSON; fall back to reasoning when content is empty or prose."""
+    """Prefer content JSON; fall back to reasoning only when content is empty.
+
+    2026-11-17 审计 P1-5：旧实现在「正文非空但不以 { / [ 开头」时也会回退到
+    reasoning_content。而 reasoning 是模型的思考草稿，智谱 / DeepSeek 这类
+    thinking 网关经常在里面先写一份完整 JSON 草稿再改主意到正文里；把草稿当
+    正式决策送去校验并通过，等于让程序执行一段模型自己已经放弃的计划（正文
+    里明明写着「再看一眼」也照样下单）。只有正文**完全为空**时才回退；正文有
+    内容却不是 JSON，就原样返回，交给 validator 按 category-d 正常报错、降级
+    或重试。
+    """
     stripped = _strip_fences(content or "")
     if stripped.startswith("{") or stripped.startswith("["):
         return content or ""
+    if (content or "").strip():
+        return content
     if reasoning:
         from_reasoning = _strip_fences(reasoning)
         if from_reasoning.startswith("{") or from_reasoning.startswith("["):
-            logger.info("Extracting JSON from reasoning_content (content was not JSON)")
+            logger.warning(
+                "Extracting JSON from reasoning_content because content was empty"
+            )
             return from_reasoning
     return content or ""
 
@@ -591,7 +604,14 @@ class JsonValidator:
                 structure_flip_cooldown_bars=structure_flip_cooldown_bars,
             )
         except Exception as exc:  # noqa: BLE001
+            # 2026-11-17 审计 P1-6：归一化失败必须**判定为失败**。旧实现在这里
+            # 只 warning 一句，然后无条件 `return Ok(obj=obj)` —— 把未归一化的
+            # 对象当成功交出去。salvage 出来的 order_type/order_direction 全靠
+            # 正则与 direction 推导，唯一能纠正「outcome=wait 却还留着限价单」
+            # 的 `_coerce_decision_no_order` 就在 normalizer 里；跳过它等于放行
+            # 一个可能被真下单的决策。返回 None 让调用方继续走原有降级。
             logger.warning("Stage 2 salvage normalize failed: %s", exc)
+            return None
         logger.warning(
             "Stage 2 JSON unrecoverable; rebuilt minimal object from raw text"
         )

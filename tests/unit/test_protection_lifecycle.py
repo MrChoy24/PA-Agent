@@ -100,6 +100,7 @@ class _LimitClient:
         plans: list,
         market_type: str = "",
         replace_on_mismatch: bool = True,
+        margin_mode: str | None = None,
     ) -> list[ProtectionOrder]:
         self.protections.append(
             {

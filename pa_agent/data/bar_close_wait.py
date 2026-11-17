@@ -7,7 +7,10 @@ import time
 
 from pa_agent.data.base import KlineBar
 
-_TIMEFRAME_SECONDS_RE = re.compile(r"^(\d+)([mhdw])$", re.IGNORECASE)
+# 2026-11-17 审计 P2-12：这条正则以前带 re.IGNORECASE，于是 "1M"（月线，
+# 数据源的周期表 binance_source/okx_source 里就是这么写的）被 lower() 成
+# 分钟，月线被算成 60 秒。现在 m 与 M 分开：小写 m = 分钟，大写 M = 月。
+_TIMEFRAME_SECONDS_RE = re.compile(r"^(\d+)([mMhdwHDW])$")
 
 # Timeframe units use lowercase; month is handled separately.
 _TIMEFRAME_SECONDS = {
@@ -31,7 +34,12 @@ def timeframe_to_seconds(timeframe: str) -> int | None:
     if not m:
         return None
     n = int(m.group(1))
-    unit = m.group(2).lower()
+    raw_unit = m.group(2)
+    if raw_unit == "M":
+        # 月线：交易所的 1M 是自然月，这里按 30 天近似 —— 这个函数只用于
+        # 「K 线是否收盘」这类量级判断，不需要精确到日历月。
+        return n * 30 * 86400
+    unit = raw_unit.lower()
     if unit == "m":
         return n * 60
     if unit == "h":

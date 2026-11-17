@@ -7,6 +7,7 @@ TRAE Work CN 早已内置指数退避，但走 OpenAI 兼容协议的 deepseek/�
 from __future__ import annotations
 
 import logging
+import re
 import time
 from typing import Any, Callable, TypeVar
 
@@ -43,7 +44,15 @@ def is_rate_limit_error(exc: BaseException) -> bool:
     if status == 429:
         return True
     text = str(exc).lower()
-    if "429" in text or "rate limit" in text or "rate_limit" in text or "too many requests" in text:
+    # 2026-11-17 审计 P2-10：旧实现用 `"429" in text` 子串匹配，"1029"、
+    # "5429"、甚至回显里的 token 数都会命中，把普通失败当成限流白等
+    # 5/10/20/40/80 秒再切备用。改为按独立数字边界匹配，原有关键词保留。
+    if (
+        re.search(r"(?<!\d)429(?!\d)", text)
+        or "rate limit" in text
+        or "rate_limit" in text
+        or "too many requests" in text
+    ):
         return True
     cause = getattr(exc, "__cause__", None)
     if cause is not None and cause is not exc:

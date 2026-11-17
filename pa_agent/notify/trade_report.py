@@ -32,6 +32,14 @@ logger = logging.getLogger(__name__)
 #: 会触发成交回报的 reason（其余 reason 都代表「没有真实成交」）
 _REPORTABLE_REASONS = frozenset({"submitted", "pending-trigger"})
 
+#: 保护单种类的中文标签（本地映射：notify 层不 import pa_agent.trading）
+_PROTECT_KIND_LABELS = {
+    "stop_loss": "止损",
+    "take_profit_1": "TP1",
+    "take_profit_2": "TP2",
+    "take_profit": "止盈",
+}
+
 
 def _now_text() -> str:
     """本地时区的下单时间文本（与日志、流水记录同一口径）."""
@@ -148,6 +156,12 @@ def notify_trigger_resumed(
         if not dingtalk_notifier.dingtalk_is_active(settings):
             return False
 
+        # 没能从交易所确认这笔委托成交时，绝不能发「成交回报」——
+        # 2026-11-17 04:10 事故：buy 限价单从未成交，查单失败后退回看持仓，
+        # 把上一笔多头的均价当成本单成交价发给了钉钉。
+        if report.get("fill_confirmed") is False:
+            return _notify_unconfirmed_resume(report, settings=settings)
+
         return dingtalk_notifier.send_trade_report(
             venue=venue,
             symbol=str(report.get("symbol") or ""),
@@ -168,6 +182,69 @@ def notify_trigger_resumed(
         )
     except Exception as exc:  # noqa: BLE001 - 通知失败绝不影响交易
         logger.warning("突破单成交回报推送失败（忽略）：%s", exc)
+        return False
+
+
+def _notify_unconfirmed_resume(
+    report: Any,
+    *,
+    settings: "Settings | None" = None,
+) -> bool:
+    """补挂保护单完成、但**未能确认这笔委托真的成交**时发的核对提示。
+
+    与 notify_trigger_resumed 的区别：那条是「成交回报」，可以据此认为
+    仓位已经建立；这条明确写「未确认成交」，要求人工核对。宁可少一条成交喜报，
+    也不能让用户以为一笔没成交的委托已经建仓。
+    """
+    try:
+        from pa_agent.notify import dingtalk_notifier
+
+        symbol = str(report.get("symbol") or "")
+        side = "做多" if str(report.get("position_side") or "") == "long" else "做空"
+        protections = report.get("protections") or ()
+        total = len(protections)
+        # 保护单可能是 dict，也可能是 ProtectionOrder 对象（notify 层不 import 交易层）
+        ok_count = sum(
+            1
+            for item in protections
+            if bool(item.get("ok") if isinstance(item, dict) else getattr(item, "ok", False))
+        )
+        if total == 0:
+            ok_count = int(report.get("ok_count") or 0)
+        lines = [
+            f"### ⚠️ 保护单已补挂，但未确认成交（{symbol or '—'}）",
+            "",
+            "> 交易所没能回报这笔委托的成交状态，本次保护单是按**当前持仓**挂的。",
+            "> 请到交易所核对：委托是否成交、持仓数量与止损价位是否匹配。",
+            "",
+            f"- 方向：{side}",
+            f"- 持仓数量：{report.get('qty') or 0}",
+            f"- 参考均价：{report.get('entry_price') or 0}",
+            f"- 委托号：{report.get('order_id') or '—'}",
+            f"- 保护单：{ok_count}/{total} 条已挂" if total else f"- 保护单：{ok_count} 条已挂",
+        ]
+        for item in protections:
+            if isinstance(item, dict):
+                kind = str(item.get("kind") or "")
+                ok_flag = bool(item.get("ok"))
+                price = item.get("trigger_price")
+            else:  # ProtectionOrder 之类的对象
+                kind = str(getattr(item, "kind", "") or "")
+                ok_flag = bool(getattr(item, "ok", False))
+                price = getattr(item, "trigger_price", None)
+            label = _PROTECT_KIND_LABELS.get(kind, kind or "—")
+            state = "已挂" if ok_flag else "失败"
+            lines.append(f"    - {label}：{state} @ {price or '—'}")
+        return dingtalk_notifier.send_markdown(
+            f"未确认成交（{symbol or '—'}）",
+            "\n".join(lines),
+            settings=settings,
+            # 2026-11-17 审计 P2-9：这是订单相关告警，必须打 order=True，
+            # 否则 notify_on_order_only=true 时会被当普通文本吞掉。
+            order=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - 通知失败绝不影响交易
+        logger.warning("未确认成交提示推送失败（忽略）：%s", exc)
         return False
 
 
@@ -228,6 +305,9 @@ def notify_protection_failure(
             f"保护单未挂上（{symbol}）",
             "\n".join(lines),
             settings=settings,
+            # 2026-11-17 审计 P2-9：裸奔告警属于订单类，必须打 order=True，
+            # 否则 notify_on_order_only=true 时这条最重要的告警反而发不出去。
+            order=True,
         )
     except Exception as exc:  # noqa: BLE001 - 通知失败绝不影响交易
         logger.warning("保护单失败告警推送失败（忽略）：%s", exc)
